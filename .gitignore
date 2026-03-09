@@ -121,6 +121,7 @@ autogen-*.md
 # Models
 
 models/*
+/models/MiniCPM-o-4_5-gguf/
 models-mnt
 !models/.editorconfig
 !models/ggml-vocab-*.gguf*

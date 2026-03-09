@@ -129,6 +129,12 @@ static bool file_exists(const std::string & path) {
     return false;
 }
 
+static std::string make_run_output_dir() {
+    const auto now = std::chrono::system_clock::now();
+    const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return std::string("./tools/omni/output_runs/run_") + std::to_string(ts_ms);
+}
+
 static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
     OmniModelPaths paths;
     paths.llm = llm_path;
@@ -207,6 +213,7 @@ int main(int argc, char ** argv) {
     std::string vision_backend = "metal";  // vision backend: "metal" (default) or "coreml"
     std::string vision_coreml_model_path;  // CoreML model path (required when vision_backend=coreml)
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
+    std::string base_output_dir = make_run_output_dir();
     int n_ctx = 4096;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
     int media_type = 1;     // 1=audio only, 2=omni (audio+vision)
@@ -347,7 +354,11 @@ int main(int argc, char ** argv) {
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
     
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
-    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
+    printf("=== Output Directory ===\n");
+    printf("  Base output dir: %s\n", base_output_dir.c_str());
+    printf("========================\n");
+
+    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0", false, nullptr, nullptr, base_output_dir);
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;
