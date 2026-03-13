@@ -202,3 +202,10 @@ poetry.toml
 # Output directories
 tools/omni/output/
 tools/omni/output_*/
+
+# Local analysis files
+log.token2wav.fixed
+log_Q_4
+log_Q_8
+resource.csv
+指标解释.txt
