@@ -673,7 +673,9 @@ extern "C" bool ggml_cuda_marlin_w4a16_gemm(
     params.thread_k = -1;
     params.thread_n = -1;
     params.a_type = ggml_cuda_marlin_type_from_ggml(a->type);
-    params.b_type = GGML_CUDA_MARLIN_TYPE_U4B8;
+    // AWQ with explicit zero-points must use the U4 kernel family so Marlin
+    // compiles in the qzeros path instead of the symmetric U4B8 fast path.
+    params.b_type = b_zeros ? GGML_CUDA_MARLIN_TYPE_U4 : GGML_CUDA_MARLIN_TYPE_U4B8;
     params.c_type = ggml_cuda_marlin_type_from_ggml(c->type);
     params.s_type = ggml_cuda_marlin_type_from_ggml(b_scales->type);
     params.has_bias = false;

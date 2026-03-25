@@ -12,14 +12,21 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <charconv>
 #include <cmath>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -34,6 +41,542 @@ static llama_quantization_method llama_quantization_method_from_string(const std
     }
     return LLAMA_QUANTIZATION_METHOD_NONE;
 }
+
+#ifdef GGML_USE_CUDA
+static bool llama_awq_marlin_debug_enabled() {
+    const char * value = std::getenv("LLAMA_AWQ_MARLIN_DEBUG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool llama_awq_marlin_debug_match_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    if (std::strstr(name, "layers.2.mlp.gate_proj") != nullptr) {
+        return true;
+    }
+    if (std::strstr(name, "layers.2.mlp.up_proj") != nullptr) {
+        return true;
+    }
+    if (std::strstr(name, "layers.2.mlp.down_proj") != nullptr) {
+        return true;
+    }
+
+    return false;
+}
+
+static void llama_awq_marlin_debug_dump_tensor(const char * stage, const ggml_tensor * tensor, int64_t limit = 8) {
+    if (!llama_awq_marlin_debug_enabled() || tensor == nullptr) {
+        return;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    if (!llama_awq_marlin_debug_match_name(name)) {
+        return;
+    }
+
+    const int64_t ne = ggml_nelements(tensor);
+    const int64_t count = std::min<int64_t>(ne, limit);
+
+    std::ostringstream oss;
+    oss << "awq-marlin-debug: stage=" << stage
+        << " name=" << (name ? name : "<unnamed>")
+        << " type=" << ggml_type_name(tensor->type)
+        << " shape=" << llama_format_tensor_shape(tensor)
+        << " nb=[" << tensor->nb[0] << "," << tensor->nb[1] << "," << tensor->nb[2] << "," << tensor->nb[3] << "]";
+
+    if (count <= 0) {
+        LLAMA_LOG_INFO("%s\n", oss.str().c_str());
+        return;
+    }
+
+    switch (tensor->type) {
+        case GGML_TYPE_F32: {
+            std::vector<float> values(count);
+            ggml_backend_tensor_get(tensor, values.data(), 0, count * sizeof(float));
+
+            float min_value = std::numeric_limits<float>::infinity();
+            float max_value = -std::numeric_limits<float>::infinity();
+            int nan_count = 0;
+            int inf_count = 0;
+
+            oss << " first=";
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ",";
+                oss << values[i];
+                if (std::isnan(values[i])) {
+                    ++nan_count;
+                } else if (std::isinf(values[i])) {
+                    ++inf_count;
+                } else {
+                    min_value = std::min(min_value, values[i]);
+                    max_value = std::max(max_value, values[i]);
+                }
+            }
+            oss << " finite_min=" << min_value << " finite_max=" << max_value
+                << " nan=" << nan_count << " inf=" << inf_count;
+        } break;
+        case GGML_TYPE_F16: {
+            std::vector<ggml_fp16_t> raw(count);
+            ggml_backend_tensor_get(tensor, raw.data(), 0, count * sizeof(ggml_fp16_t));
+
+            float min_value = std::numeric_limits<float>::infinity();
+            float max_value = -std::numeric_limits<float>::infinity();
+            int nan_count = 0;
+            int inf_count = 0;
+
+            oss << " first=";
+            for (int64_t i = 0; i < count; ++i) {
+                const float value = ggml_fp16_to_fp32(raw[i]);
+                if (i) oss << ",";
+                oss << value;
+                if (std::isnan(value)) {
+                    ++nan_count;
+                } else if (std::isinf(value)) {
+                    ++inf_count;
+                } else {
+                    min_value = std::min(min_value, value);
+                    max_value = std::max(max_value, value);
+                }
+            }
+            oss << " finite_min=" << min_value << " finite_max=" << max_value
+                << " nan=" << nan_count << " inf=" << inf_count;
+        } break;
+        case GGML_TYPE_I32: {
+            std::vector<int32_t> values(count);
+            ggml_backend_tensor_get(tensor, values.data(), 0, count * sizeof(int32_t));
+
+            int32_t min_value = std::numeric_limits<int32_t>::max();
+            int32_t max_value = std::numeric_limits<int32_t>::min();
+
+            oss << " first=";
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ",";
+                oss << values[i];
+                min_value = std::min(min_value, values[i]);
+                max_value = std::max(max_value, values[i]);
+            }
+            oss << " min=" << min_value << " max=" << max_value;
+        } break;
+        default:
+            oss << " first=<unsupported>";
+            break;
+    }
+
+    LLAMA_LOG_INFO("%s\n", oss.str().c_str());
+}
+
+static int llama_cuda_device_from_tensor(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(tensor->buffer != nullptr);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        throw std::runtime_error(format("%s: tensor '%s' is not on a CUDA device", __func__, ggml_get_name(tensor)));
+    }
+
+    const char * dev_name = ggml_backend_dev_name(dev);
+    if (dev_name == nullptr) {
+        throw std::runtime_error(format("%s: unable to resolve CUDA device for tensor '%s'", __func__, ggml_get_name(tensor)));
+    }
+
+    int device = 0;
+    auto parsed = std::from_chars(dev_name + 4, dev_name + std::strlen(dev_name), device);
+    if (std::strncmp(dev_name, GGML_CUDA_NAME, 4) != 0 || parsed.ec != std::errc() || parsed.ptr == dev_name + 4) {
+        throw std::runtime_error(format("%s: tensor '%s' is not on a CUDA device (got '%s')", __func__, ggml_get_name(tensor), dev_name));
+    }
+
+    if (buft != ggml_backend_dev_buffer_type(dev)) {
+        throw std::runtime_error(format("%s: tensor '%s' uses unsupported CUDA buffer type '%s' for Marlin repack",
+                __func__, ggml_get_name(tensor), ggml_backend_buft_name(buft)));
+    }
+
+    return device;
+}
+
+static int llama_cuda_device_from_dev(ggml_backend_dev_t dev, const char * tensor_name) {
+    if (dev == nullptr) {
+        throw std::runtime_error(format("%s: unable to resolve CUDA device for tensor '%s'", __func__, tensor_name));
+    }
+
+    const char * dev_name = ggml_backend_dev_name(dev);
+    if (dev_name == nullptr) {
+        throw std::runtime_error(format("%s: unable to resolve CUDA device name for tensor '%s'", __func__, tensor_name));
+    }
+
+    int device = 0;
+    auto parsed = std::from_chars(dev_name + 4, dev_name + std::strlen(dev_name), device);
+    if (std::strncmp(dev_name, GGML_CUDA_NAME, 4) != 0 || parsed.ec != std::errc() || parsed.ptr == dev_name + 4) {
+        throw std::runtime_error(format("%s: unsupported CUDA device '%s' for tensor '%s'", __func__, dev_name, tensor_name));
+    }
+
+    return device;
+}
+
+static ggml_backend_t llama_init_cuda_backend_for_tensor(const ggml_tensor * tensor, int * device_out) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(device_out != nullptr);
+
+    int device = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+    if (dev != nullptr && buft == ggml_backend_dev_buffer_type(dev)) {
+        device = llama_cuda_device_from_tensor(tensor);
+    } else {
+        ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (cuda_dev == nullptr) {
+            throw std::runtime_error(format("%s: no CUDA device available for tensor '%s'", __func__, ggml_get_name(tensor)));
+        }
+        device = llama_cuda_device_from_dev(cuda_dev, ggml_get_name(tensor));
+    }
+
+    ggml_backend_t backend = ggml_backend_cuda_init(device);
+    if (backend == nullptr) {
+        throw std::runtime_error(format("%s: failed to initialize CUDA backend for tensor '%s'", __func__, ggml_get_name(tensor)));
+    }
+
+    *device_out = device;
+    return backend;
+}
+
+static ggml_backend_buffer_ptr llama_alloc_cuda_tensor_buffer(ggml_backend_t backend, const ggml_tensor * tensor) {
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(tensor != nullptr);
+
+    ggml_backend_buffer_ptr buf { ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), ggml_nbytes(tensor)) };
+    if (!buf) {
+        throw std::runtime_error(format("%s: failed to allocate CUDA buffer for tensor '%s'", __func__, ggml_get_name(tensor)));
+    }
+
+    return buf;
+}
+
+static void llama_rehome_tensor_to_cuda(
+        ggml_tensor * tensor,
+        ggml_backend_t backend,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(backend != nullptr);
+
+    ggml_backend_buffer_ptr dst_buf = llama_alloc_cuda_tensor_buffer(backend, tensor);
+
+    ggml_tensor dst = *tensor;
+    dst.buffer = dst_buf.get();
+    dst.data = ggml_backend_buffer_get_base(dst_buf.get());
+
+    ggml_backend_tensor_copy(tensor, &dst);
+
+    tensor->buffer = dst_buf.get();
+    tensor->data = dst.data;
+    owned_buffers.emplace_back(std::move(dst_buf));
+}
+
+static void llama_permute_awq_scales_to_cuda(
+        ggml_tensor * scales,
+        int64_t size_k,
+        int64_t group_size,
+        ggml_backend_t backend,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    llama_awq_marlin_debug_dump_tensor("scales.pre_permute", scales);
+
+    static constexpr std::array<int, 64> k_scale_perm = {
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    };
+    static constexpr std::array<int, 32> k_scale_perm_single = {
+         0,  1,  8,  9, 16, 17, 24, 25,
+         2,  3, 10, 11, 18, 19, 26, 27,
+         4,  5, 12, 13, 20, 21, 28, 29,
+         6,  7, 14, 15, 22, 23, 30, 31,
+    };
+
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+
+    const bool use_full_perm = group_size < size_k && group_size != -1;
+    const int64_t perm_block = use_full_perm
+            ? (int64_t) k_scale_perm.size()
+            : (int64_t) k_scale_perm_single.size();
+    GGML_ASSERT(scales->ne[1] % perm_block == 0);
+
+    const size_t nbytes = ggml_nbytes(scales);
+    std::vector<float> host(ggml_nelements(scales));
+    std::vector<float> permuted(host.size());
+
+    ggml_backend_tensor_get(scales, host.data(), 0, nbytes);
+
+    const int64_t rows = scales->ne[0];
+    const int64_t cols = scales->ne[1];
+
+    for (int64_t row = 0; row < rows; ++row) {
+        const float * src = host.data() + row * cols;
+        float * dst = permuted.data() + row * cols;
+
+        for (int64_t base = 0; base < cols; base += perm_block) {
+            if (use_full_perm) {
+                for (size_t i = 0; i < k_scale_perm.size(); ++i) {
+                    dst[base + (int64_t) i] = src[base + (int64_t) k_scale_perm[i]];
+                }
+            } else {
+                for (size_t i = 0; i < k_scale_perm_single.size(); ++i) {
+                    dst[base + (int64_t) i] = src[base + (int64_t) k_scale_perm_single[i]];
+                }
+            }
+        }
+    }
+
+    std::vector<ggml_fp16_t> permuted_f16(permuted.size());
+    ggml_fp32_to_fp16_row(permuted.data(), permuted_f16.data(), permuted.size());
+
+    ggml_tensor dst = *scales;
+    dst.type = GGML_TYPE_F16;
+    dst.nb[0] = sizeof(ggml_fp16_t);
+    dst.nb[1] = dst.nb[0] * dst.ne[0];
+    dst.nb[2] = dst.nb[1] * dst.ne[1];
+    dst.nb[3] = dst.nb[2] * dst.ne[2];
+
+    ggml_backend_buffer_ptr dst_buf { ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), ggml_nbytes(&dst)) };
+    if (!dst_buf) {
+        throw std::runtime_error(format("%s: failed to allocate CUDA buffer for tensor '%s'", __func__, ggml_get_name(scales)));
+    }
+
+    dst.buffer = dst_buf.get();
+    dst.data = ggml_backend_buffer_get_base(dst_buf.get());
+
+    ggml_backend_tensor_set(&dst, permuted_f16.data(), 0, ggml_nbytes(&dst));
+
+    scales->type = dst.type;
+    scales->buffer = dst_buf.get();
+    scales->data = dst.data;
+    scales->nb[0] = dst.nb[0];
+    scales->nb[1] = dst.nb[1];
+    scales->nb[2] = dst.nb[2];
+    scales->nb[3] = dst.nb[3];
+    owned_buffers.emplace_back(std::move(dst_buf));
+
+    llama_awq_marlin_debug_dump_tensor("scales.post_permute", scales);
+}
+
+static void llama_convert_awq_qzeros_to_marlin_cuda(
+        ggml_tensor * qzeros,
+        int64_t num_bits,
+        int64_t size_n,
+        ggml_backend_t backend,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    llama_awq_marlin_debug_dump_tensor("qzeros.pre_permute", qzeros);
+
+    static constexpr std::array<int, 64> k_scale_perm = {
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    };
+    static constexpr std::array<int, 8> k_awq_interleave = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    static constexpr std::array<int, 8> k_awq_undo_interleave = { 0, 4, 1, 5, 2, 6, 3, 7 };
+
+    GGML_ASSERT(qzeros != nullptr);
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(qzeros->type == GGML_TYPE_I32);
+    GGML_ASSERT(num_bits == 4);
+
+    const int64_t pack_factor = 32 / num_bits;
+    const int64_t rows = qzeros->ne[0];
+    const int64_t packed_cols = qzeros->ne[1];
+    GGML_ASSERT(size_n == packed_cols * pack_factor);
+    GGML_ASSERT(size_n % (int64_t) k_scale_perm.size() == 0);
+
+    const size_t nbytes = ggml_nbytes(qzeros);
+    std::vector<uint32_t> host_packed(ggml_nelements(qzeros));
+    ggml_backend_tensor_get(qzeros, host_packed.data(), 0, nbytes);
+
+    std::vector<uint32_t> unpacked(rows * size_n);
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < packed_cols; ++col) {
+            const uint32_t packed = host_packed[row * packed_cols + col];
+            for (int64_t i = 0; i < pack_factor; ++i) {
+                unpacked[row * size_n + col * pack_factor + i] = (packed >> (i * num_bits)) & 0xFu;
+            }
+        }
+    }
+
+    std::vector<uint32_t> awq_uninterleaved(unpacked.size());
+    for (int64_t row = 0; row < rows; ++row) {
+        const uint32_t * src = unpacked.data() + row * size_n;
+        uint32_t * dst = awq_uninterleaved.data() + row * size_n;
+
+        for (int64_t base = 0; base < size_n; base += (int64_t) k_awq_undo_interleave.size()) {
+            for (size_t i = 0; i < k_awq_undo_interleave.size(); ++i) {
+                dst[base + (int64_t) i] = src[base + (int64_t) k_awq_undo_interleave[i]];
+            }
+        }
+    }
+
+    std::vector<uint32_t> marlin_permuted(awq_uninterleaved.size());
+    for (int64_t row = 0; row < rows; ++row) {
+        const uint32_t * src = awq_uninterleaved.data() + row * size_n;
+        uint32_t * dst = marlin_permuted.data() + row * size_n;
+
+        for (int64_t base = 0; base < size_n; base += (int64_t) k_scale_perm.size()) {
+            for (size_t i = 0; i < k_scale_perm.size(); ++i) {
+                dst[base + (int64_t) i] = src[base + (int64_t) k_scale_perm[i]];
+            }
+        }
+    }
+
+    std::vector<uint32_t> marlin_interleaved(marlin_permuted.size());
+    for (int64_t row = 0; row < rows; ++row) {
+        const uint32_t * src = marlin_permuted.data() + row * size_n;
+        uint32_t * dst = marlin_interleaved.data() + row * size_n;
+
+        for (int64_t base = 0; base < size_n; base += (int64_t) k_awq_interleave.size()) {
+            for (size_t i = 0; i < k_awq_interleave.size(); ++i) {
+                dst[base + (int64_t) i] = src[base + (int64_t) k_awq_interleave[i]];
+            }
+        }
+    }
+
+    std::vector<uint32_t> repacked(rows * packed_cols, 0);
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < packed_cols; ++col) {
+            uint32_t packed = 0;
+            for (int64_t i = 0; i < pack_factor; ++i) {
+                packed |= (marlin_interleaved[row * size_n + col * pack_factor + i] & 0xFu) << (i * num_bits);
+            }
+            repacked[row * packed_cols + col] = packed;
+        }
+    }
+
+    ggml_tensor dst = *qzeros;
+    ggml_backend_buffer_ptr dst_buf { ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), ggml_nbytes(&dst)) };
+    if (!dst_buf) {
+        throw std::runtime_error(format("%s: failed to allocate CUDA buffer for tensor '%s'", __func__, ggml_get_name(qzeros)));
+    }
+
+    dst.buffer = dst_buf.get();
+    dst.data = ggml_backend_buffer_get_base(dst_buf.get());
+    ggml_backend_tensor_set(&dst, repacked.data(), 0, ggml_nbytes(&dst));
+
+    qzeros->buffer = dst_buf.get();
+    qzeros->data = dst.data;
+    owned_buffers.emplace_back(std::move(dst_buf));
+
+    llama_awq_marlin_debug_dump_tensor("qzeros.post_permute", qzeros);
+}
+
+static void llama_repack_awq_qweight_for_marlin(
+        ggml_tensor * qweight,
+        const ggml_tensor * scales,
+        int64_t num_bits,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    llama_awq_marlin_debug_dump_tensor("qweight.pre_repack", qweight);
+
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(qweight->type == GGML_TYPE_I32);
+
+    int device = 0;
+    ggml_backend_ptr backend { llama_init_cuda_backend_for_tensor(qweight, &device) };
+
+    ggml_tensor src = *qweight;
+    ggml_backend_buffer_ptr src_buf;
+
+    ggml_backend_buffer_type_t qweight_buft = ggml_backend_buffer_get_type(qweight->buffer);
+    ggml_backend_dev_t qweight_dev = ggml_backend_buft_get_device(qweight_buft);
+    if (!(qweight_dev != nullptr && qweight_buft == ggml_backend_dev_buffer_type(qweight_dev))) {
+        src_buf = llama_alloc_cuda_tensor_buffer(backend.get(), qweight);
+        src.buffer = src_buf.get();
+        src.data = ggml_backend_buffer_get_base(src_buf.get());
+        ggml_backend_tensor_copy(qweight, &src);
+    }
+
+    ggml_backend_buffer_ptr dst_buf = llama_alloc_cuda_tensor_buffer(backend.get(), qweight);
+    void * dst_data = ggml_backend_buffer_get_base(dst_buf.get());
+
+    const bool ok = ggml_cuda_marlin_awq_repack(
+            static_cast<const uint32_t *>(src.data),
+            static_cast<uint32_t *>(dst_data),
+            qweight->ne[0],
+            scales->ne[1],
+            num_bits,
+            false,
+            device,
+            nullptr);
+    if (!ok) {
+        throw std::runtime_error(format("%s: ggml_cuda_marlin_awq_repack failed for tensor '%s'", __func__, ggml_get_name(qweight)));
+    }
+
+    ggml_backend_synchronize(backend.get());
+    qweight->buffer = dst_buf.get();
+    qweight->data = dst_data;
+    owned_buffers.emplace_back(std::move(dst_buf));
+
+    llama_awq_marlin_debug_dump_tensor("qweight.post_repack", qweight);
+}
+
+static void llama_repack_qwen3_awq_tensors_to_marlin(llama_model & model, std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    if (model.arch != LLM_ARCH_QWEN3 || model.hparams.quant_method != LLAMA_QUANTIZATION_METHOD_AWQ) {
+        return;
+    }
+
+    if (model.hparams.quant_bits != 4) {
+        throw std::runtime_error(format("%s: only AWQ 4-bit Marlin repack is supported", __func__));
+    }
+
+    auto repack_triplet = [&](ggml_tensor * qweight, ggml_tensor * qzeros, ggml_tensor * scales) {
+        if (qweight == nullptr || qzeros == nullptr || scales == nullptr) {
+            return;
+        }
+
+        int device = 0;
+        ggml_backend_ptr backend { llama_init_cuda_backend_for_tensor(qweight, &device) };
+
+        llama_repack_awq_qweight_for_marlin(qweight, scales, model.hparams.quant_bits, owned_buffers);
+        llama_convert_awq_qzeros_to_marlin_cuda(
+                qzeros,
+                model.hparams.quant_bits,
+                scales->ne[1],
+                backend.get(),
+                owned_buffers);
+        llama_permute_awq_scales_to_cuda(
+                scales,
+                qweight->ne[0],
+                model.hparams.quant_group_size,
+                backend.get(),
+                owned_buffers);
+    };
+
+    for (llama_layer & layer : model.layers) {
+        repack_triplet(layer.wq_awq_qweight,       layer.wq_awq_qzeros,       layer.wq_awq_scale);
+        repack_triplet(layer.wk_awq_qweight,       layer.wk_awq_qzeros,       layer.wk_awq_scale);
+        repack_triplet(layer.wv_awq_qweight,       layer.wv_awq_qzeros,       layer.wv_awq_scale);
+        repack_triplet(layer.wo_awq_qweight,       layer.wo_awq_qzeros,       layer.wo_awq_scale);
+        repack_triplet(layer.ffn_gate_awq_qweight, layer.ffn_gate_awq_qzeros, layer.ffn_gate_awq_scale);
+        repack_triplet(layer.ffn_up_awq_qweight,   layer.ffn_up_awq_qzeros,   layer.ffn_up_awq_scale);
+        repack_triplet(layer.ffn_down_awq_qweight, layer.ffn_down_awq_qzeros, layer.ffn_down_awq_scale);
+    }
+}
+#else
+static void llama_repack_qwen3_awq_tensors_to_marlin(llama_model & model, std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    GGML_UNUSED(owned_buffers);
+    if (model.arch == LLM_ARCH_QWEN3 && model.hparams.quant_method == LLAMA_QUANTIZATION_METHOD_AWQ) {
+        throw std::runtime_error("Qwen3 AWQ Marlin repack requires GGML_USE_CUDA");
+    }
+}
+#endif
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -3315,9 +3858,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const int64_t n_groups = in_features / hparams.quant_group_size;
                             const int64_t packed_out_features = out_features / awq_pack_factor;
 
-                            qweight = create_tensor(tn(qweight_id, "weight", i), {in_features, packed_out_features}, TENSOR_NOT_REQUIRED);
-                            qzeros  = create_tensor(tn(qzeros_id,  "weight", i), {n_groups, packed_out_features}, TENSOR_NOT_REQUIRED);
-                            scales  = create_tensor(tn(scales_id,  "weight", i), {n_groups, out_features},        TENSOR_NOT_REQUIRED);
+                            qweight = create_tensor(tn(qweight_id, i), {in_features, packed_out_features}, TENSOR_NOT_REQUIRED);
+                            qzeros  = create_tensor(tn(qzeros_id,  i), {n_groups, packed_out_features}, TENSOR_NOT_REQUIRED);
+                            scales  = create_tensor(tn(scales_id,  i), {n_groups, out_features},        TENSOR_NOT_REQUIRED);
                         };
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
@@ -6261,6 +6804,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    llama_repack_qwen3_awq_tensors_to_marlin(*this, pimpl->bufs);
 
     return true;
 }
@@ -9352,6 +9897,7 @@ struct llm_build_qwen2moe : public llm_graph_context {
 struct llm_build_qwen3 : public llm_graph_context {
     llm_build_qwen3(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
+        const bool is_awq_qwen3 = hparams.quant_method == LLAMA_QUANTIZATION_METHOD_AWQ;
 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -9368,6 +9914,24 @@ struct llm_build_qwen3 : public llm_graph_context {
 
         ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+        const auto has_awq_linear = [&](ggml_tensor * qweight, ggml_tensor * qzeros, ggml_tensor * scales) {
+            return is_awq_qwen3 && qweight != nullptr && qzeros != nullptr && scales != nullptr;
+        };
+
+        const auto build_qwen3_linear = [&](ggml_tensor * dense,
+                                            ggml_tensor * qweight,
+                                            ggml_tensor * qzeros,
+                                            ggml_tensor * scales,
+                                            ggml_tensor * input,
+                                            int il) -> ggml_tensor * {
+            if (has_awq_linear(qweight, qzeros, scales)) {
+                return build_awq_marlin_mm(input, qweight, qzeros, scales, il);
+            }
+
+            GGML_ASSERT(dense != nullptr);
+            return build_lora_mm(dense, input);
+        };
+
         for (int il = 0; il < n_layer; ++il) {
             ggml_tensor * inpSA = inpL;
 
@@ -9380,13 +9944,28 @@ struct llm_build_qwen3 : public llm_graph_context {
             // self-attention
             {
                 // compute Q and K and RoPE them
-                ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+                ggml_tensor * Qcur = build_qwen3_linear(
+                        model.layers[il].wq,
+                        model.layers[il].wq_awq_qweight,
+                        model.layers[il].wq_awq_qzeros,
+                        model.layers[il].wq_awq_scale,
+                        cur, il);
                 cb(Qcur, "Qcur", il);
 
-                ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
+                ggml_tensor * Kcur = build_qwen3_linear(
+                        model.layers[il].wk,
+                        model.layers[il].wk_awq_qweight,
+                        model.layers[il].wk_awq_qzeros,
+                        model.layers[il].wk_awq_scale,
+                        cur, il);
                 cb(Kcur, "Kcur", il);
 
-                ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
+                ggml_tensor * Vcur = build_qwen3_linear(
+                        model.layers[il].wv,
+                        model.layers[il].wv_awq_qweight,
+                        model.layers[il].wv_awq_qzeros,
+                        model.layers[il].wv_awq_scale,
+                        cur, il);
                 cb(Vcur, "Vcur", il);
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -9416,8 +9995,19 @@ struct llm_build_qwen3 : public llm_graph_context {
                 cb(Vcur, "Vcur", il);
 
                 cur = build_attn(inp_attn,
-                        model.layers[il].wo, model.layers[il].bo,
+                        nullptr, nullptr,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+
+                cur = build_qwen3_linear(
+                        model.layers[il].wo,
+                        model.layers[il].wo_awq_qweight,
+                        model.layers[il].wo_awq_qzeros,
+                        model.layers[il].wo_awq_scale,
+                        cur, il);
+
+                if (model.layers[il].bo) {
+                    cur = ggml_add(ctx0, cur, model.layers[il].bo);
+                }
             }
 
             if (il == n_layer - 1 && inp_out_ids) {
@@ -9434,12 +10024,31 @@ struct llm_build_qwen3 : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            ggml_tensor * ffn_up = build_qwen3_linear(
+                    model.layers[il].ffn_up,
+                    model.layers[il].ffn_up_awq_qweight,
+                    model.layers[il].ffn_up_awq_qzeros,
+                    model.layers[il].ffn_up_awq_scale,
+                    cur, il);
+            cb(ffn_up, "ffn_up", il);
+
+            ggml_tensor * ffn_gate = build_qwen3_linear(
+                    model.layers[il].ffn_gate,
+                    model.layers[il].ffn_gate_awq_qweight,
+                    model.layers[il].ffn_gate_awq_qzeros,
+                    model.layers[il].ffn_gate_awq_scale,
+                    cur, il);
+            cb(ffn_gate, "ffn_gate", il);
+
+            cur = ggml_swiglu_split(ctx0, ffn_gate, ffn_up);
+            cb(cur, "ffn_swiglu", il);
+
+            cur = build_qwen3_linear(
+                    model.layers[il].ffn_down,
+                    model.layers[il].ffn_down_awq_qweight,
+                    model.layers[il].ffn_down_awq_qzeros,
+                    model.layers[il].ffn_down_awq_scale,
+                    cur, il);
             cb(cur, "ffn_out", il);
 
             cur = ggml_add(ctx0, cur, ffn_inp);

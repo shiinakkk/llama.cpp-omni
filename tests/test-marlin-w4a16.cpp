@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -69,6 +70,46 @@ std::vector<int> get_scale_perm_single() {
     return perm;
 }
 
+std::array<int, 64> get_scale_perm_grouped() {
+    return {
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    };
+}
+
+std::vector<uint32_t> pack_u4_rows(const std::vector<uint32_t> & values, int rows, int cols) {
+    std::vector<uint32_t> packed(rows * (cols / kPackFactor), 0);
+    const int packed_cols = cols / kPackFactor;
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            const int packed_col = col / kPackFactor;
+            const int shift = (col % kPackFactor) * kNumBits;
+            packed[row * packed_cols + packed_col] |= (values[row * cols + col] & 0xFu) << shift;
+        }
+    }
+    return packed;
+}
+
+std::vector<uint32_t> unpack_u4_rows(const std::vector<uint32_t> & packed, int rows, int cols) {
+    std::vector<uint32_t> unpacked(rows * cols, 0);
+    const int packed_cols = cols / kPackFactor;
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < packed_cols; ++col) {
+            const uint32_t word = packed[row * packed_cols + col];
+            for (int i = 0; i < kPackFactor; ++i) {
+                unpacked[row * cols + col * kPackFactor + i] = (word >> (i * kNumBits)) & 0xFu;
+            }
+        }
+    }
+    return unpacked;
+}
+
 std::vector<uint32_t> marlin_pack_u4_weights(const std::vector<uint32_t> & q_w, int size_k, int size_n) {
     const auto perm = get_weight_perm();
     const int tile_k_blocks = size_k / kTile;
@@ -96,54 +137,305 @@ std::vector<uint32_t> marlin_pack_u4_weights(const std::vector<uint32_t> & q_w, 
         }
     }
 
-    std::vector<uint32_t> packed(tile_k_blocks * (size_n * kTile / kPackFactor), 0);
-    const int packed_cols = size_n * kTile / kPackFactor;
-    for (int row = 0; row < tile_k_blocks; ++row) {
-        for (int col = 0; col < size_n * kTile; ++col) {
-            const int packed_col = col / kPackFactor;
-            const int shift = (col % kPackFactor) * kNumBits;
-            packed[row * packed_cols + packed_col] |= (permuted[row * (size_n * kTile) + col] & 0xFu) << shift;
-        }
-    }
-
-    return packed;
+    return pack_u4_rows(permuted, tile_k_blocks, size_n * kTile);
 }
 
-std::vector<__half> marlin_permute_scales_single(const std::vector<__half> & scales, int size_n) {
-    const auto perm = get_scale_perm_single();
+std::vector<__half> marlin_permute_scales(const std::vector<float> & scales, int num_groups, int size_n, bool use_grouped_perm) {
     std::vector<__half> out(scales.size());
-    const int block = static_cast<int>(perm.size());
-    for (int row = 0; row < static_cast<int>(scales.size()) / size_n; ++row) {
-        const __half * src = scales.data() + row * size_n;
+    const auto perm_grouped = get_scale_perm_grouped();
+    const auto perm_single = get_scale_perm_single();
+    const int block = use_grouped_perm ? static_cast<int>(perm_grouped.size()) : static_cast<int>(perm_single.size());
+
+    for (int row = 0; row < num_groups; ++row) {
+        const float * src = scales.data() + row * size_n;
         __half * dst = out.data() + row * size_n;
         for (int base = 0; base < size_n; base += block) {
-            for (int i = 0; i < block; ++i) {
-                dst[base + i] = src[base + perm[i]];
+            if (use_grouped_perm) {
+                for (int i = 0; i < block; ++i) {
+                    dst[base + i] = __float2half(src[base + perm_grouped[i]]);
+                }
+            } else {
+                for (int i = 0; i < block; ++i) {
+                    dst[base + i] = __float2half(src[base + perm_single[i]]);
+                }
             }
         }
     }
+
     return out;
 }
 
-float ref_weight(uint32_t q) {
-    return static_cast<float>(static_cast<int>(q) - 8);
+std::vector<uint32_t> marlin_permute_qzeros(const std::vector<uint32_t> & qzeros_awq_packed, int rows, int size_n) {
+    static constexpr std::array<int, 8> kAwqInterleave = {0, 2, 4, 6, 1, 3, 5, 7};
+    static constexpr std::array<int, 8> kAwqUndoInterleave = {0, 4, 1, 5, 2, 6, 3, 7};
+    const auto scale_perm = get_scale_perm_grouped();
+
+    std::vector<uint32_t> unpacked = unpack_u4_rows(qzeros_awq_packed, rows, size_n);
+    std::vector<uint32_t> awq_uninterleaved(unpacked.size());
+    std::vector<uint32_t> marlin_permuted(unpacked.size());
+    std::vector<uint32_t> marlin_interleaved(unpacked.size());
+
+    for (int row = 0; row < rows; ++row) {
+        const uint32_t * src = unpacked.data() + row * size_n;
+        uint32_t * dst = awq_uninterleaved.data() + row * size_n;
+        for (int base = 0; base < size_n; base += static_cast<int>(kAwqUndoInterleave.size())) {
+            for (size_t i = 0; i < kAwqUndoInterleave.size(); ++i) {
+                dst[base + static_cast<int>(i)] = src[base + kAwqUndoInterleave[i]];
+            }
+        }
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        const uint32_t * src = awq_uninterleaved.data() + row * size_n;
+        uint32_t * dst = marlin_permuted.data() + row * size_n;
+        for (int base = 0; base < size_n; base += static_cast<int>(scale_perm.size())) {
+            for (size_t i = 0; i < scale_perm.size(); ++i) {
+                dst[base + static_cast<int>(i)] = src[base + scale_perm[i]];
+            }
+        }
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        const uint32_t * src = marlin_permuted.data() + row * size_n;
+        uint32_t * dst = marlin_interleaved.data() + row * size_n;
+        for (int base = 0; base < size_n; base += static_cast<int>(kAwqInterleave.size())) {
+            for (size_t i = 0; i < kAwqInterleave.size(); ++i) {
+                dst[base + static_cast<int>(i)] = src[base + kAwqInterleave[i]];
+            }
+        }
+    }
+
+    return pack_u4_rows(marlin_interleaved, rows, size_n);
+}
+
+std::vector<uint32_t> pack_awq_qzeros_source(const std::vector<uint32_t> & logical_qzeros, int rows, int size_n) {
+    static constexpr std::array<int, 8> kAwqInterleave = {0, 2, 4, 6, 1, 3, 5, 7};
+
+    std::vector<uint32_t> awq_interleaved(logical_qzeros.size());
+    for (int row = 0; row < rows; ++row) {
+        const uint32_t * src = logical_qzeros.data() + row * size_n;
+        uint32_t * dst = awq_interleaved.data() + row * size_n;
+        for (int base = 0; base < size_n; base += static_cast<int>(kAwqInterleave.size())) {
+            for (size_t i = 0; i < kAwqInterleave.size(); ++i) {
+                dst[base + kAwqInterleave[i]] = src[base + static_cast<int>(i)];
+            }
+        }
+    }
+
+    return pack_u4_rows(awq_interleaved, rows, size_n);
+}
+
+struct TestCase {
+    std::string name;
+    int m;
+    int n;
+    int k;
+    int group_size;
+    bool use_qzeros;
+    bool use_grouped_scale_perm;
+};
+
+struct DeviceBuffers {
+    __half * d_a = nullptr;
+    uint32_t * d_b = nullptr;
+    __half * d_scales = nullptr;
+    uint32_t * d_qzeros = nullptr;
+    __half * d_c = nullptr;
+    int * d_workspace = nullptr;
+};
+
+void free_device_buffers(DeviceBuffers & buffers) {
+    if (buffers.d_workspace) CUDA_CHECK(cudaFree(buffers.d_workspace));
+    if (buffers.d_c) CUDA_CHECK(cudaFree(buffers.d_c));
+    if (buffers.d_qzeros) CUDA_CHECK(cudaFree(buffers.d_qzeros));
+    if (buffers.d_scales) CUDA_CHECK(cudaFree(buffers.d_scales));
+    if (buffers.d_b) CUDA_CHECK(cudaFree(buffers.d_b));
+    if (buffers.d_a) CUDA_CHECK(cudaFree(buffers.d_a));
+}
+
+float dequant_awq_value(uint32_t q, float scale, uint32_t zero) {
+    return (static_cast<float>(q) - static_cast<float>(zero)) * scale;
+}
+
+float dequant_no_zp_value(uint32_t q, float scale) {
+    return (static_cast<float>(q) - 8.0f) * scale;
+}
+
+void run_test_case(int device, const TestCase & tc) {
+    const int num_groups = tc.group_size > 0 ? tc.k / tc.group_size : 1;
+    if (tc.group_size > 0 && tc.k % tc.group_size != 0) {
+        throw std::runtime_error(tc.name + ": invalid group_size");
+    }
+    if (tc.n % 64 != 0) {
+        throw std::runtime_error(tc.name + ": n must be divisible by 64");
+    }
+
+    std::vector<__half> a_host(tc.m * tc.k);
+    std::vector<uint32_t> q_w_host(tc.k * tc.n);
+    std::vector<float> scales_host(num_groups * tc.n);
+    std::vector<uint32_t> qzeros_logical;
+    std::vector<uint32_t> qzeros_awq_packed;
+    std::vector<float> ref_host(tc.m * tc.n, 0.0f);
+
+    for (int row = 0; row < tc.m; ++row) {
+        for (int col = 0; col < tc.k; ++col) {
+            const float value = float(((row * 11 + col * 7 + 3) % 23) - 11) * 0.125f;
+            a_host[row * tc.k + col] = __float2half(value);
+        }
+    }
+
+    for (int row = 0; row < tc.k; ++row) {
+        for (int col = 0; col < tc.n; ++col) {
+            q_w_host[row * tc.n + col] = static_cast<uint32_t>((row * 13 + col * 5 + 7) & 0xF);
+        }
+    }
+
+    for (int group = 0; group < num_groups; ++group) {
+        for (int col = 0; col < tc.n; ++col) {
+            const float scale = 0.03125f * float(1 + ((group * 7 + col * 3 + 5) % 11));
+            scales_host[group * tc.n + col] = scale;
+        }
+    }
+
+    if (tc.use_qzeros) {
+        qzeros_logical.resize(num_groups * tc.n);
+        for (int group = 0; group < num_groups; ++group) {
+            for (int col = 0; col < tc.n; ++col) {
+                qzeros_logical[group * tc.n + col] = static_cast<uint32_t>((group * 5 + col * 9 + 2) & 0xF);
+            }
+        }
+        qzeros_awq_packed = pack_awq_qzeros_source(qzeros_logical, num_groups, tc.n);
+    }
+
+    for (int row = 0; row < tc.m; ++row) {
+        for (int col = 0; col < tc.n; ++col) {
+            float acc = 0.0f;
+            for (int kk = 0; kk < tc.k; ++kk) {
+                const int group = tc.group_size > 0 ? kk / tc.group_size : 0;
+                const float scale = scales_host[group * tc.n + col];
+                const uint32_t q = q_w_host[kk * tc.n + col];
+                const float w = tc.use_qzeros
+                        ? dequant_awq_value(q, scale, qzeros_logical[group * tc.n + col])
+                        : dequant_no_zp_value(q, scale);
+                acc += __half2float(a_host[row * tc.k + kk]) * w;
+            }
+            ref_host[row * tc.n + col] = acc;
+        }
+    }
+
+    const std::vector<uint32_t> packed_b_host = marlin_pack_u4_weights(q_w_host, tc.k, tc.n);
+    const std::vector<__half> packed_scales_host =
+            marlin_permute_scales(scales_host, num_groups, tc.n, tc.use_grouped_scale_perm);
+    const std::vector<uint32_t> packed_qzeros_host = tc.use_qzeros
+            ? marlin_permute_qzeros(qzeros_awq_packed, num_groups, tc.n)
+            : std::vector<uint32_t>();
+
+    DeviceBuffers buffers;
+    ggml_context * ctx = nullptr;
+    try {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_a), a_host.size() * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_b), packed_b_host.size() * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_scales), packed_scales_host.size() * sizeof(__half)));
+        if (tc.use_qzeros) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_qzeros), packed_qzeros_host.size() * sizeof(uint32_t)));
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_c), tc.m * tc.n * sizeof(__half)));
+
+        const int workspace_elems = ggml_cuda_marlin_min_workspace_elements(device);
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_workspace), workspace_elems * sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(buffers.d_a, a_host.data(), a_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_b, packed_b_host.data(), packed_b_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_scales, packed_scales_host.data(), packed_scales_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+        if (tc.use_qzeros) {
+            CUDA_CHECK(cudaMemcpy(buffers.d_qzeros, packed_qzeros_host.data(), packed_qzeros_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        }
+        CUDA_CHECK(cudaMemset(buffers.d_c, 0, tc.m * tc.n * sizeof(__half)));
+        CUDA_CHECK(cudaMemset(buffers.d_workspace, 0, workspace_elems * sizeof(int)));
+
+        ggml_init_params ggml_params = {
+            /*.mem_size   =*/ 1 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx = ggml_init(ggml_params);
+        if (ctx == nullptr) {
+            throw std::runtime_error(tc.name + ": ggml_init failed");
+        }
+
+        ggml_tensor * a_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tc.k, tc.m);
+        ggml_tensor * b_qweight_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, tc.k, tc.n / kPackFactor);
+        ggml_tensor * b_scales_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, num_groups, tc.n);
+        ggml_tensor * b_qzeros_tensor = tc.use_qzeros
+                ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, num_groups, tc.n / kPackFactor)
+                : nullptr;
+        ggml_tensor * c_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tc.n, tc.m);
+        ggml_tensor * workspace_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, workspace_elems);
+
+        a_tensor->data = buffers.d_a;
+        b_qweight_tensor->data = buffers.d_b;
+        b_scales_tensor->data = buffers.d_scales;
+        if (b_qzeros_tensor != nullptr) {
+            b_qzeros_tensor->data = buffers.d_qzeros;
+        }
+        c_tensor->data = buffers.d_c;
+        workspace_tensor->data = buffers.d_workspace;
+
+        if (!ggml_cuda_marlin_w4a16_gemm(
+                    a_tensor,
+                    b_qweight_tensor,
+                    b_scales_tensor,
+                    b_qzeros_tensor,
+                    c_tensor,
+                    workspace_tensor,
+                    device,
+                    nullptr)) {
+            throw std::runtime_error(tc.name + ": ggml_cuda_marlin_w4a16_gemm returned false");
+        }
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<__half> c_host(tc.m * tc.n);
+        CUDA_CHECK(cudaMemcpy(c_host.data(), buffers.d_c, c_host.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+
+        float max_abs_err = 0.0f;
+        for (int i = 0; i < tc.m * tc.n; ++i) {
+            const float got = __half2float(c_host[i]);
+            const float want = ref_host[i];
+            if (!std::isfinite(got)) {
+                throw std::runtime_error(tc.name + ": output contains non-finite values");
+            }
+            max_abs_err = std::max(max_abs_err, std::fabs(got - want));
+            if (std::fabs(got - want) > 2e-2f) {
+                throw std::runtime_error(
+                        tc.name + ": mismatch at " + std::to_string(i) +
+                        " got=" + std::to_string(got) +
+                        " want=" + std::to_string(want));
+            }
+        }
+
+        std::cout << tc.name << " passed, max_abs_err=" << max_abs_err << '\n';
+    } catch (...) {
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+        free_device_buffers(buffers);
+        throw;
+    }
+
+    ggml_free(ctx);
+    free_device_buffers(buffers);
 }
 
 } // namespace
 
 int main() {
     int device_count = 0;
-    cudaError_t count_status = cudaGetDeviceCount(&device_count);
+    const cudaError_t count_status = cudaGetDeviceCount(&device_count);
     if (count_status != cudaSuccess || device_count == 0) {
         std::cout << "SKIP: CUDA device not available\n";
         return 0;
     }
-
-    constexpr int m = 16;
-    constexpr int n = 64;
-    constexpr int k = 128;
-    constexpr int group_size = -1;
-    constexpr int num_groups = 1;
 
     int device = 0;
     CUDA_CHECK(cudaSetDevice(device));
@@ -157,117 +449,27 @@ int main() {
         return 0;
     }
 
-    std::vector<__half> a_host(m * k);
-    std::vector<uint32_t> q_w_host(k * n);
-    std::vector<__half> scales_host(num_groups * n, __float2half(1.0f));
-    std::vector<float> ref_host(m * n, 0.0f);
-
-    for (int row = 0; row < m; ++row) {
-        for (int col = 0; col < k; ++col) {
-            const float value = float(((row * 5 + col * 3) % 11) - 5) * 0.5f;
-            a_host[row * k + col] = __float2half(value);
-        }
-    }
-
-    for (int row = 0; row < k; ++row) {
-        for (int col = 0; col < n; ++col) {
-            q_w_host[row * n + col] = static_cast<uint32_t>((row * 7 + col * 5 + 3) & 0xF);
-        }
-    }
-
-    for (int row = 0; row < m; ++row) {
-        for (int col = 0; col < n; ++col) {
-            float acc = 0.0f;
-            for (int kk = 0; kk < k; ++kk) {
-                acc += __half2float(a_host[row * k + kk]) * ref_weight(q_w_host[kk * n + col]);
-            }
-            ref_host[row * n + col] = acc;
-        }
-    }
-
-    const std::vector<uint32_t> packed_b_host = marlin_pack_u4_weights(q_w_host, k, n);
-    const std::vector<__half> packed_scales_host = marlin_permute_scales_single(scales_host, n);
-
-    __half * d_a = nullptr;
-    uint32_t * d_b = nullptr;
-    __half * d_scales = nullptr;
-    __half * d_c = nullptr;
-    int * d_workspace = nullptr;
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_a), a_host.size() * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_b), packed_b_host.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_scales), packed_scales_host.size() * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_c), m * n * sizeof(__half)));
-
-    const int workspace_elems = ggml_cuda_marlin_min_workspace_elements(device);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_workspace), workspace_elems * sizeof(int)));
-
-    CUDA_CHECK(cudaMemcpy(d_a, a_host.data(), a_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, packed_b_host.data(), packed_b_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_scales, packed_scales_host.data(), packed_scales_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_c, 0, m * n * sizeof(__half)));
-    CUDA_CHECK(cudaMemset(d_workspace, 0, workspace_elems * sizeof(int)));
-
-    ggml_init_params ggml_params = {
-        /*.mem_size   =*/ 1 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
+    std::vector<TestCase> cases = {
+        {"single_group_scales", 16, 64, 128, -1, false, false},
+        {"grouped_scales", 16, 64, 128, 32, false, true},
     };
-    ggml_context * ctx = ggml_init(ggml_params);
-    if (ctx == nullptr) {
-        std::cerr << "ggml_init failed\n";
-        return 1;
+
+    const bool run_qzeros_probe = std::getenv("LLAMA_MARLIN_RUN_QZEROS_PROBE") != nullptr;
+    if (run_qzeros_probe) {
+        cases.push_back({"grouped_scales_qzeros", 16, 64, 128, 32, true, true});
+    } else {
+        std::cout << "SKIP: grouped_scales_qzeros probe is disabled by default; set LLAMA_MARLIN_RUN_QZEROS_PROBE=1 to run it\n";
     }
 
-    ggml_tensor * a_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
-    ggml_tensor * b_qweight_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n / kPackFactor);
-    ggml_tensor * b_scales_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, num_groups, n);
-    ggml_tensor * c_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, m);
-    ggml_tensor * workspace_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, workspace_elems);
-
-    a_tensor->data = d_a;
-    b_qweight_tensor->data = d_b;
-    b_scales_tensor->data = d_scales;
-    c_tensor->data = d_c;
-    workspace_tensor->data = d_workspace;
-
-    if (!ggml_cuda_marlin_w4a16_gemm(
-                a_tensor,
-                b_qweight_tensor,
-                b_scales_tensor,
-                nullptr,
-                c_tensor,
-                workspace_tensor,
-                device,
-                nullptr)) {
-        std::cerr << "ggml_cuda_marlin_w4a16_gemm returned false\n";
-        ggml_free(ctx);
-        return 1;
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    std::vector<__half> c_host(m * n);
-    CUDA_CHECK(cudaMemcpy(c_host.data(), d_c, c_host.size() * sizeof(__half), cudaMemcpyDeviceToHost));
-
-    float max_abs_err = 0.0f;
-    for (int i = 0; i < m * n; ++i) {
-        const float got = __half2float(c_host[i]);
-        const float want = ref_host[i];
-        max_abs_err = std::max(max_abs_err, std::fabs(got - want));
-        if (std::fabs(got - want) > 1e-2f) {
-            std::cerr << "Mismatch at " << i << ": got=" << got << " want=" << want << '\n';
-            return 1;
+    try {
+        for (const TestCase & tc : cases) {
+            run_test_case(device, tc);
         }
+    } catch (const std::exception & err) {
+        std::cerr << err.what() << '\n';
+        return 1;
     }
 
-    CUDA_CHECK(cudaFree(d_workspace));
-    CUDA_CHECK(cudaFree(d_c));
-    CUDA_CHECK(cudaFree(d_scales));
-    CUDA_CHECK(cudaFree(d_b));
-    CUDA_CHECK(cudaFree(d_a));
-    ggml_free(ctx);
-
-    std::cout << "Marlin W4A16 GEMM test passed, max_abs_err=" << max_abs_err << '\n';
+    std::cout << "All enabled Marlin W4A16 tests passed\n";
     return 0;
 }

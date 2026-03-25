@@ -411,6 +411,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
                                 const std::string & base_output_dir = "./tools/omni/output");
 
+struct omni_context * omni_init_text_only(struct common_params * params,
+                                          const std::string & base_output_dir = "./tools/omni/output");
+
 void omni_free(struct omni_context * ctx_omni);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
@@ -432,6 +435,11 @@ bool stream_decode(struct omni_context * ctx_omni,
 bool stop_speek(struct omni_context * ctx_omni);
 
 bool clean_kvcache(struct omni_context * ctx_omni);
+
+bool omni_text_infer_once(struct omni_context * ctx_omni,
+                          const std::string & user_prompt,
+                          std::string & response,
+                          bool print_output = true);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);

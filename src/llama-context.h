@@ -217,6 +217,11 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+#ifdef DEBUG_TENSOR
+    friend bool llama_debug_tensor_eval_trampoline(struct ggml_tensor * t, bool ask, void * user_data);
+    bool debug_tensor_eval(struct ggml_tensor * t, bool ask) const;
+#endif
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -231,6 +236,12 @@ private:
     const llama_model & model;
 
     llama_cparams       cparams;
+
+#ifdef DEBUG_TENSOR
+    ggml_backend_sched_eval_callback debug_tensor_prev_cb_eval = nullptr;
+    void * debug_tensor_prev_cb_eval_user_data = nullptr;
+#endif
+
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
 

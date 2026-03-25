@@ -7,10 +7,114 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+
+#ifdef DEBUG_TENSOR
+static bool llama_debug_tensor_should_log(const ggml_tensor * t) {
+    const char * name = ggml_get_name(t);
+    return name != nullptr && name[0] != '\0';
+}
+
+static void tensor_log_n(const ggml_tensor * t, int n) {
+    if (t == nullptr) {
+        LLAMA_LOG_INFO("DEBUG_TENSOR: <null tensor>\n");
+        return;
+    }
+
+    const int64_t ne = ggml_nelements(t);
+    const int64_t count = std::min<int64_t>(ne, n);
+    const char * name = ggml_get_name(t);
+
+    LLAMA_LOG_INFO(
+            "DEBUG_TENSOR: name=%s op=%s type=%s shape=%s n=%lld\n",
+            (name && name[0] != '\0') ? name : "<unnamed>",
+            ggml_op_name(t->op),
+            ggml_type_name(t->type),
+            llama_format_tensor_shape(t).c_str(),
+            (long long) count);
+
+    if (count <= 0) {
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "DEBUG_TENSOR: values=";
+
+    switch (t->type) {
+        case GGML_TYPE_F32: {
+            std::vector<float> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(float));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << buf[i];
+            }
+        } break;
+        case GGML_TYPE_F16: {
+            std::vector<ggml_fp16_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(ggml_fp16_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << ggml_fp16_to_fp32(buf[i]);
+            }
+        } break;
+        case GGML_TYPE_BF16: {
+            std::vector<ggml_bf16_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(ggml_bf16_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << ggml_bf16_to_fp32(buf[i]);
+            }
+        } break;
+        case GGML_TYPE_I8: {
+            std::vector<int8_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(int8_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << (int) buf[i];
+            }
+        } break;
+        case GGML_TYPE_I16: {
+            std::vector<int16_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(int16_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << buf[i];
+            }
+        } break;
+        case GGML_TYPE_I32: {
+            std::vector<int32_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(int32_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << buf[i];
+            }
+        } break;
+        case GGML_TYPE_I64: {
+            std::vector<int64_t> buf(count);
+            ggml_backend_tensor_get(t, buf.data(), 0, count*sizeof(int64_t));
+            for (int64_t i = 0; i < count; ++i) {
+                if (i) oss << ", ";
+                oss << buf[i];
+            }
+        } break;
+        default:
+            oss << "<unsupported type for value dump>";
+            break;
+    }
+
+    LLAMA_LOG_INFO("%s\n", oss.str().c_str());
+}
+
+bool llama_debug_tensor_eval_trampoline(struct ggml_tensor * t, bool ask, void * user_data) {
+    const auto * lctx = static_cast<const llama_context *>(user_data);
+    return lctx->debug_tensor_eval(t, ask);
+}
+#endif
 
 //
 // llama_context
@@ -55,6 +159,13 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+#ifdef DEBUG_TENSOR
+    debug_tensor_prev_cb_eval = cparams.cb_eval;
+    debug_tensor_prev_cb_eval_user_data = cparams.cb_eval_user_data;
+    cparams.cb_eval = llama_debug_tensor_eval_trampoline;
+    cparams.cb_eval_user_data = this;
+#endif
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1466,6 +1577,27 @@ ggml_status llama_context::graph_compute(
 
     return status;
 }
+
+#ifdef DEBUG_TENSOR
+bool llama_context::debug_tensor_eval(struct ggml_tensor * t, bool ask) const {
+    const bool want_debug_tensor = llama_debug_tensor_should_log(t);
+    const bool want_user = debug_tensor_prev_cb_eval ? debug_tensor_prev_cb_eval(t, ask, debug_tensor_prev_cb_eval_user_data) : false;
+
+    if (ask) {
+        return want_debug_tensor || want_user;
+    }
+
+    if (want_debug_tensor) {
+        tensor_log_n(t, 10);
+    }
+
+    if (debug_tensor_prev_cb_eval) {
+        return debug_tensor_prev_cb_eval(t, false, debug_tensor_prev_cb_eval_user_data);
+    }
+
+    return true;
+}
+#endif
 
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {

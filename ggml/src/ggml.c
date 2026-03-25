@@ -949,6 +949,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "L2_NORM",
 
     "MUL_MAT",
+    "MARLIN_W4A16",
     "MUL_MAT_ID",
     "OUT_PROD",
 
@@ -1019,7 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1053,6 +1054,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "l2_norm(x)",
 
     "X*Y",
+    "marlin_w4a16(x, qweight, scales, qzeros, workspace)",
     "X[i]*Y",
     "X*Y",
 
@@ -1123,7 +1125,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3052,6 +3054,43 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_marlin_w4a16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * qweight,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * qzeros,
+        struct ggml_tensor  * workspace) {
+    GGML_ASSERT(a != NULL);
+    GGML_ASSERT(qweight != NULL);
+    GGML_ASSERT(scales != NULL);
+    GGML_ASSERT(qzeros != NULL);
+    GGML_ASSERT(workspace != NULL);
+
+    GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(qweight->type == GGML_TYPE_I32);
+    GGML_ASSERT(qzeros->type == GGML_TYPE_I32);
+    GGML_ASSERT(workspace->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
+
+    GGML_ASSERT(a->ne[0] == qweight->ne[0]);
+    GGML_ASSERT(a->ne[0] % qzeros->ne[0] == 0);
+    GGML_ASSERT(qzeros->ne[0] == scales->ne[0]);
+    GGML_ASSERT(qzeros->ne[1] * 8 == scales->ne[1]);
+
+    const int64_t ne[4] = { scales->ne[1], a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
+
+    result->op     = GGML_OP_MARLIN_W4A16;
+    result->src[0] = a;
+    result->src[1] = qweight;
+    result->src[2] = scales;
+    result->src[3] = qzeros;
+    result->src[4] = workspace;
 
     return result;
 }

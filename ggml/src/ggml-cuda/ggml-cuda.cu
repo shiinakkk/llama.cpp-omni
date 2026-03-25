@@ -23,6 +23,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/marlin-op.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2407,6 +2408,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+        case GGML_OP_MARLIN_W4A16:
+            ggml_cuda_op_marlin_w4a16(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -3460,6 +3464,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
+        case GGML_OP_MARLIN_W4A16:
+            {
+                const ggml_tensor * a         = op->src[0];
+                const ggml_tensor * qweight   = op->src[1];
+                const ggml_tensor * scales    = op->src[2];
+                const ggml_tensor * qzeros    = op->src[3];
+                const ggml_tensor * workspace = op->src[4];
+
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                return cc >= GGML_CUDA_CC_TURING &&
+                    a != nullptr && qweight != nullptr && scales != nullptr && qzeros != nullptr && workspace != nullptr &&
+                    ggml_is_contiguous(a) &&
+                    ggml_is_contiguous(qweight) &&
+                    ggml_is_contiguous(scales) &&
+                    ggml_is_contiguous(qzeros) &&
+                    ggml_is_contiguous(workspace) &&
+                    (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16) &&
+                    qweight->type == GGML_TYPE_I32 &&
+                    qzeros->type == GGML_TYPE_I32 &&
+                    workspace->type == GGML_TYPE_I32 &&
+                    op->type == a->type;
+            } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
@@ -3688,6 +3714,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MARLIN_W4A16:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:

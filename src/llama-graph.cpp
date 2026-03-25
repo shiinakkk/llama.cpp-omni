@@ -632,6 +632,39 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_awq_marlin_mm(
+         ggml_tensor * cur,
+         ggml_tensor * qweight,
+         ggml_tensor * qzeros,
+         ggml_tensor * scales,
+                 int   il) const {
+    GGML_ASSERT(cur != nullptr);
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(qzeros != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(loras->empty() && "LoRA is not supported on the AWQ Marlin path yet");
+
+    if (cur->type != GGML_TYPE_F16 && cur->type != GGML_TYPE_BF16) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "awq_marlin_input", il);
+    }
+
+    // Keep a placeholder src in the graph; the CUDA backend allocates the real
+    // Marlin workspace at execution time based on the active device.
+    ggml_tensor * workspace = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    cb(workspace, "awq_marlin_workspace", il);
+
+    ggml_tensor * res = ggml_marlin_w4a16(ctx0, cur, qweight, scales, qzeros, workspace);
+    cb(res, "awq_marlin_mm", il);
+
+    if (res->type != GGML_TYPE_F32) {
+        res = ggml_cast(ctx0, res, GGML_TYPE_F32);
+        cb(res, "awq_marlin_mm_f32", il);
+    }
+
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b

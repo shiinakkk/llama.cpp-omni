@@ -3469,6 +3469,95 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     return model;
 }
 
+static void omni_init_special_tokens(struct omni_context * ctx_omni, llama_model * model) {
+    const struct llama_vocab * vocab = llama_model_get_vocab(model);
+    if (vocab == nullptr) {
+        return;
+    }
+
+    auto find_token = [&](const char * token_str) -> llama_token {
+        llama_token tokens[4];
+        int n_tokens = llama_tokenize(vocab, token_str, strlen(token_str), tokens, 4, false, true);
+        if (n_tokens == 1) {
+            return tokens[0];
+        }
+
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            char buf[128];
+            int len = llama_token_to_piece(vocab, i, buf, sizeof(buf), 0, true);
+            if (len > 0 && len < (int) sizeof(buf)) {
+                buf[len] = '\0';
+                if (strcmp(buf, token_str) == 0) {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
+    };
+
+    ctx_omni->special_token_speak = find_token("<|speak|>");
+    ctx_omni->special_token_listen = find_token("<|listen|>");
+    ctx_omni->special_token_chunk_eos = find_token("<|chunk_eos|>");
+    ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
+    ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
+    ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
+    ctx_omni->special_token_eos = llama_vocab_eos(vocab);
+
+    llama_token tts_bos = find_token("<|tts_bos|>");
+    if (tts_bos >= 0) {
+        ctx_omni->tts_bos_token_id = tts_bos;
+    }
+
+    ctx_omni->special_token_unit_end = find_token("</unit>");
+    ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
+}
+
+struct omni_context * omni_init_text_only(struct common_params * params,
+                                          const std::string & base_output_dir) {
+    print_with_timestamp("=== omni_init_text_only start\n");
+
+    auto ctx_omni = new omni_context();
+    ctx_omni->params = params;
+    ctx_omni->media_type = 0;
+    ctx_omni->use_tts = false;
+    ctx_omni->duplex_mode = false;
+    ctx_omni->base_output_dir = base_output_dir;
+
+    llama_model * model = llama_init(params, params->model.path);
+    if (model == NULL) {
+        delete ctx_omni;
+        return NULL;
+    }
+
+    llama_context_params ctx_params = common_context_params_to_llama(*params);
+    ctx_params.n_ctx = params->n_ctx;
+
+    llama_context * ctx_llama = llama_new_context_with_model(model, ctx_params);
+    if (ctx_llama == NULL) {
+        LOG_ERR("%s: error: failed to create the llama_context\n", __func__);
+        llama_free_model(model);
+        delete ctx_omni;
+        return NULL;
+    }
+
+    struct common_sampler * sampler = common_sampler_init(model, params->sampling);
+    ctx_omni->ctx_llama = ctx_llama;
+    ctx_omni->model = model;
+    ctx_omni->ctx_sampler = sampler;
+    ctx_omni->owns_model = true;
+    ctx_omni->n_past = 0;
+    ctx_omni->async = false;
+    ctx_omni->llm_thread_info = new LLMThreadInfo(1);
+
+    omni_init_special_tokens(ctx_omni, model);
+    omni_warmup_ane(ctx_omni);
+
+    print_with_timestamp("=== omni_init_text_only success: ctx_llama = %p\n", (void *) ctx_omni->ctx_llama);
+    return ctx_omni;
+}
+
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
@@ -3931,56 +4020,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         }
     }
     ctx_omni->async = true;
-    
     // ==================== 初始化特殊 Token ID ====================
     // 从 LLM 词表中查找并缓存特殊 token ID
     // 这些 token 用于控制双工模式下的状态切换
-    
-    const struct llama_vocab * vocab = llama_model_get_vocab(model);
-    if (vocab) {
-        // 使用 llama_tokenize 直接将字符串转换为 token ID
-        // parse_special=true 确保特殊 token 被正确解析
-        auto find_token = [&](const char * token_str) -> llama_token {
-            llama_token tokens[4];  // 预留空间
-            int n_tokens = llama_tokenize(vocab, token_str, strlen(token_str), tokens, 4, false, true);
-            if (n_tokens == 1) {
-                return tokens[0];
-            }
-            // 如果 tokenize 失败，尝试遍历词表查找（使用 special=true）
-            int n_vocab = llama_vocab_n_tokens(vocab);
-            for (int i = 0; i < n_vocab; i++) {
-                char buf[128];
-                int len = llama_token_to_piece(vocab, i, buf, sizeof(buf), 0, true);  // special=true
-                if (len > 0 && len < (int)sizeof(buf)) {
-                    buf[len] = '\0';
-                    if (strcmp(buf, token_str) == 0) {
-                        return i;
-                    }
-                }
-            }
-            return -1;
-        };
-        
-        ctx_omni->special_token_speak = find_token("<|speak|>");
-        ctx_omni->special_token_listen = find_token("<|listen|>");
-        ctx_omni->special_token_chunk_eos = find_token("<|chunk_eos|>");
-        ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
-        ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
-        ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
-        ctx_omni->special_token_eos = llama_vocab_eos(vocab);
-        
-        // 同时初始化 tts_bos_token_id（用于双工模式强制继续说话）
-        llama_token tts_bos = find_token("<|tts_bos|>");
-        if (tts_bos >= 0) {
-            ctx_omni->tts_bos_token_id = tts_bos;
-        }
-        // 初始化 </unit> token（用于双工模式 chunk 边界标记）
-        ctx_omni->special_token_unit_end = find_token("</unit>");
-        
-        // 🔧 [双工模式] 初始化 <|tts_pad|> token（双工模式下禁止采样此 token）
-        // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
-        ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
-    }
+    omni_init_special_tokens(ctx_omni, model);
         
     // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
     omni_warmup_ane(ctx_omni);
@@ -9596,5 +9639,94 @@ bool clean_kvcache(struct omni_context * ctx_omni) {
         print_with_timestamp("🧹 clean_kvcache: clean_kvcache=false, 跳过清理\n");
     }
     
+    return true;
+}
+
+
+bool omni_text_infer_once(struct omni_context * ctx_omni,
+                          const std::string & user_prompt,
+                          std::string & response,
+                          bool print_output) {
+    response.clear();
+
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->ctx_sampler == nullptr || ctx_omni->params == nullptr) {
+        LOG_ERR("%s: invalid omni context\n", __func__);
+        return false;
+    }
+    if (user_prompt.empty()) {
+        LOG_ERR("%s: empty user prompt\n", __func__);
+        return false;
+    }
+    if (ctx_omni->llm_thread.joinable() || ctx_omni->tts_thread.joinable() || ctx_omni->t2w_thread.joinable()) {
+        LOG_ERR("%s: text-only inference requires omni threads to be stopped\n", __func__);
+        return false;
+    }
+
+    ctx_omni->params->prompt = user_prompt;
+    common_sampler_reset(ctx_omni->ctx_sampler);
+
+    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    if (mem) {
+        llama_memory_clear(mem, true);
+    }
+
+    ctx_omni->n_past = 0;
+    ctx_omni->n_keep = 0;
+    ctx_omni->system_prompt_initialized = false;
+    ctx_omni->current_turn_ended = true;
+    ctx_omni->ended_with_listen = false;
+    sliding_window_reset(ctx_omni);
+    ctx_omni->system_preserve_length = 0;
+    ctx_omni->round_start_positions.clear();
+
+    const std::string prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    if (eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false) == false) {
+        LOG_ERR("%s: failed to eval text prompt\n", __func__);
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+    const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+
+    if (print_output) {
+        LOG_INF("<user>%s\n", user_prompt.c_str());
+        LOG_INF("<assistant>");
+    }
+
+    for (int i = 0; i < max_tgt_len; ++i) {
+        llama_token id = 0;
+        std::string piece;
+        {
+            std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
+            id = common_sampler_sample(ctx_omni->ctx_sampler, ctx_omni->ctx_llama, -1);
+            common_sampler_accept(ctx_omni->ctx_sampler, id, true);
+
+            if (llama_vocab_is_eog(vocab, id) || id == ctx_omni->special_token_eos) {
+                break;
+            }
+
+            piece = common_token_to_piece(ctx_omni->ctx_llama, id);
+            if (eval_id(ctx_omni, ctx_omni->params, id, &ctx_omni->n_past) == false) {
+                LOG_ERR("%s: failed to eval sampled token\n", __func__);
+                return false;
+            }
+        }
+
+        if (piece == "<|im_end|>" || piece == "<|endoftext|>") {
+            break;
+        }
+
+        response += piece;
+        if (print_output) {
+            printf("%s", piece.c_str());
+            fflush(stdout);
+        }
+    }
+
+    if (print_output) {
+        printf("\n");
+        fflush(stdout);
+    }
+
     return true;
 }

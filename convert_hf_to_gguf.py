@@ -282,6 +282,18 @@ class ModelBase:
         del name, bid, n_dims  # unused
         return False
 
+    @staticmethod
+    def get_tensor_raw_dtype(data_torch: Tensor) -> gguf.GGMLQuantizationType | None:
+        if data_torch.dtype == torch.int8:
+            return gguf.GGMLQuantizationType.I8
+        if data_torch.dtype == torch.int16:
+            return gguf.GGMLQuantizationType.I16
+        if data_torch.dtype == torch.int32:
+            return gguf.GGMLQuantizationType.I32
+        if data_torch.dtype == torch.int64:
+            return gguf.GGMLQuantizationType.I64
+        return None
+
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
@@ -400,9 +412,10 @@ class ModelBase:
                 continue
 
             old_dtype = data_torch.dtype
+            raw_dtype = self.get_tensor_raw_dtype(data_torch)
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if raw_dtype is None and data_torch.dtype not in (torch.float16, torch.float32):
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -413,9 +426,12 @@ class ModelBase:
                     break
 
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
-                # TODO: why do we squeeze here?
-                # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
+                if raw_dtype is not None:
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {raw_dtype.name}, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=raw_dtype)
+                    continue
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -749,12 +765,12 @@ class TextModel(ModelBase):
         return seems_special
 
     # used for GPT-2 BPE and WordPiece vocabs
-    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+    def get_vocab_base(self, trust_remote_code: bool = False) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=trust_remote_code)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
         assert max(tokenizer.vocab.values()) < vocab_size
 
@@ -1039,8 +1055,8 @@ class TextModel(ModelBase):
     def _set_vocab_none(self) -> None:
         self.gguf_writer.add_tokenizer_model("none")
 
-    def _set_vocab_gpt2(self) -> None:
-        tokens, toktypes, tokpre = self.get_vocab_base()
+    def _set_vocab_gpt2(self, trust_remote_code: bool = False) -> None:
+        tokens, toktypes, tokpre = self.get_vocab_base(trust_remote_code=trust_remote_code)
         self.gguf_writer.add_tokenizer_model("gpt2")
         self.gguf_writer.add_tokenizer_pre(tokpre)
         self.gguf_writer.add_token_list(tokens)
@@ -3982,6 +3998,81 @@ class Qwen3Model(Qwen2Model):
                     return [cls_out_head]
 
         return super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("MiniCPMO")
+class MiniCPMOModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    _awq_linear_suffixes = (".qweight", ".qzeros", ".scales")
+    _awq_passthrough_prefix = "__mini_cpmo_awq__."
+
+    def set_vocab(self):
+        self._set_vocab_gpt2(trust_remote_code=True)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        quant_cfg = self.hparams.get("quantization_config") or {}
+        if quant_cfg.get("quant_method") == "awq":
+            self.gguf_writer.add_string("qwen3.quantization.method", "awq")
+            self.gguf_writer.add_uint32("qwen3.quantization.bits", int(quant_cfg["bits"]))
+            self.gguf_writer.add_uint32("qwen3.quantization.group_size", int(quant_cfg["group_size"]))
+            self.gguf_writer.add_bool("qwen3.quantization.zero_point", bool(quant_cfg.get("zero_point", False)))
+
+    @staticmethod
+    def _normalize_llm_tensor_name(name: str) -> str | None:
+        if not name.startswith("llm."):
+            return None
+
+        name = name.removeprefix("llm.")
+        if name.startswith(("vpm.", "apm.", "resampler.", "audio_projection_layer.", "tts.")):
+            return None
+
+        if name.startswith("model."):
+            return name
+        if name.startswith("lm_head."):
+            return name
+        return None
+
+    def _map_awq_tensor_name(self, name: str) -> str:
+        if name.endswith(".qweight"):
+            base_name = name[:-len(".qweight")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.qweight"
+        if name.endswith(".qzeros"):
+            base_name = name[:-len(".qzeros")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.qzeros"
+        if name.endswith(".scales"):
+            base_name = name[:-len(".scales")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.scales"
+        raise ValueError(f"Unsupported AWQ tensor name: {name}")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid  # unused
+
+        if name.startswith(self._awq_passthrough_prefix):
+            return [(name.removeprefix(self._awq_passthrough_prefix), data_torch)]
+
+        if not name.startswith("llm."):
+            # prepare_tensors() runs modify_tensors() twice. On the second pass, names that
+            # were already converted to final GGUF names should pass through unchanged.
+            if name == "head_code.0.weight":
+                return []
+            if name.startswith(("vpm.", "apm.", "resampler.", "audio_projection_layer.", "tts.")):
+                return []
+            return [(name, data_torch)]
+
+        normalized = self._normalize_llm_tensor_name(name)
+        if normalized is None:
+            return []
+
+        if normalized.endswith(self._awq_linear_suffixes):
+            return [(self._awq_passthrough_prefix + self._map_awq_tensor_name(normalized), data_torch.T)]
+
+        return super().modify_tensors(data_torch, normalized, None)
 
 
 @ModelBase.register("Qwen3MoeForCausalLM")
@@ -9409,6 +9500,10 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.int8: np.int8,
+        torch.int16: np.int16,
+        torch.int32: np.int32,
+        torch.int64: np.int64,
         torch.uint8: np.uint8,
     }
 
