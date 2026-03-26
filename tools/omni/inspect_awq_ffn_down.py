@@ -34,6 +34,14 @@ class DumpTensorRecord:
     path: Path
 
 
+@dataclass
+class WeightVariant:
+    name: str
+    description: str
+    qzeros_u4: np.ndarray
+    weight_f32: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Inspect MiniCPM AWQ ffn_down tensors and debug-log prefixes."
@@ -82,6 +90,18 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="How many mismatching output positions to print.",
     )
+    parser.add_argument(
+        "--variant-report",
+        type=int,
+        default=6,
+        help="How many weight/qzeros semantic variants to summarize.",
+    )
+    parser.add_argument(
+        "--top-terms",
+        type=int,
+        default=12,
+        help="How many largest contribution terms to print per breakdown row.",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +116,14 @@ def unpack_u4_cols(packed: np.ndarray, rows: int, cols: int) -> np.ndarray:
     out = np.empty((rows, cols), dtype=np.uint8)
     for i in range(PACK_FACTOR):
         out[:, i::PACK_FACTOR] = ((packed >> (4 * i)) & 0xF).astype(np.uint8)
+    return out
+
+
+def undo_awq_interleave(values: np.ndarray) -> np.ndarray:
+    perm = np.array([0, 4, 1, 5, 2, 6, 3, 7], dtype=np.int64)
+    out = values.copy()
+    for base in range(0, values.shape[1], perm.size):
+        out[:, base:base + perm.size] = values[:, base + perm]
     return out
 
 
@@ -226,8 +254,8 @@ def summarize_compare(cpu: np.ndarray, runtime: np.ndarray, max_report: int) -> 
         print("top_mismatches:")
         for idx in worst:
             flat = int(finite_pos[idx])
-            row = flat % runtime.shape[0]
-            col = flat // runtime.shape[0]
+            row = flat // runtime.shape[1]
+            col = flat % runtime.shape[1]
             print(
                 f"  out[{row}, {col}] cpu={float(cpu[row, col]):.6f} "
                 f"runtime={float(runtime[row, col]):.6f} abs_err={float(abs_diff[row, col]):.6f}"
@@ -238,11 +266,166 @@ def summarize_compare(cpu: np.ndarray, runtime: np.ndarray, max_report: int) -> 
         flat = np.flatnonzero(nonfinite_mask)[:max_report]
         print("runtime_nonfinite:")
         for pos in flat:
-            row = int(pos % runtime.shape[0])
-            col = int(pos // runtime.shape[0])
+            row = int(pos // runtime.shape[1])
+            col = int(pos % runtime.shape[1])
             print(
                 f"  out[{row}, {col}] cpu={float(cpu[row, col]):.6f} "
                 f"runtime={runtime[row, col]}"
+            )
+
+
+def compare_arrays(cpu: np.ndarray, runtime: np.ndarray) -> dict[str, float | int]:
+    diff = cpu - runtime
+    abs_diff = np.abs(diff)
+    finite_mask = np.isfinite(runtime) & np.isfinite(cpu)
+    metrics: dict[str, float | int] = {
+        "finite_count": int(np.count_nonzero(finite_mask)),
+        "total_count": int(runtime.size),
+        "nonfinite_runtime_count": int(np.count_nonzero(~np.isfinite(runtime))),
+        "nonfinite_cpu_count": int(np.count_nonzero(~np.isfinite(cpu))),
+    }
+    if np.any(finite_mask):
+        finite_abs = abs_diff[finite_mask]
+        metrics["max_abs_err"] = float(np.max(finite_abs))
+        metrics["mean_abs_err"] = float(np.mean(finite_abs))
+    else:
+        metrics["max_abs_err"] = math.inf
+        metrics["mean_abs_err"] = math.inf
+    return metrics
+
+
+def make_weight_variants(
+    qweight_u4: np.ndarray,
+    qzeros_u4_plain: np.ndarray,
+    scales: np.ndarray,
+    group_size: int,
+) -> list[WeightVariant]:
+    repeated_scales = np.repeat(scales, group_size, axis=0)
+    qzeros_variants = {
+        "plain": qzeros_u4_plain.astype(np.float32),
+        "undo_awq_interleave": undo_awq_interleave(qzeros_u4_plain).astype(np.float32),
+    }
+    variants: list[WeightVariant] = []
+
+    for qzeros_name, qzeros_u4 in qzeros_variants.items():
+        repeated_qzeros = np.repeat(qzeros_u4, group_size, axis=0)
+        variants.append(
+            WeightVariant(
+                name=f"{qzeros_name}:awq_zp",
+                description=f"{qzeros_name} qzeros, weight=(q-zp)*scale",
+                qzeros_u4=qzeros_u4,
+                weight_f32=(qweight_u4.astype(np.float32) - repeated_qzeros) * repeated_scales,
+            )
+        )
+        variants.append(
+            WeightVariant(
+                name=f"{qzeros_name}:awq_zp_plus_1",
+                description=f"{qzeros_name} qzeros, weight=(q-(zp+1))*scale",
+                qzeros_u4=qzeros_u4,
+                weight_f32=(qweight_u4.astype(np.float32) - (repeated_qzeros + 1.0)) * repeated_scales,
+            )
+        )
+
+    variants.append(
+        WeightVariant(
+            name="symmetric_u4b8",
+            description="ignore qzeros, weight=(q-8)*scale",
+            qzeros_u4=qzeros_u4_plain.astype(np.float32),
+            weight_f32=(qweight_u4.astype(np.float32) - 8.0) * repeated_scales,
+        )
+    )
+    return variants
+
+
+def print_variant_scoreboard(
+    variants: list[WeightVariant],
+    down_input: np.ndarray,
+    runtime_output: np.ndarray,
+    dump_token: int,
+    prefix: int,
+    variant_report: int,
+) -> list[tuple[WeightVariant, np.ndarray, dict[str, float | int]]]:
+    scored: list[tuple[WeightVariant, np.ndarray, dict[str, float | int]]] = []
+    for variant in variants:
+        cpu_output = variant.weight_f32.T @ down_input
+        metrics = compare_arrays(cpu_output, runtime_output)
+        scored.append((variant, cpu_output, metrics))
+
+    scored.sort(
+        key=lambda item: (
+            float(item[2]["max_abs_err"]),
+            float(item[2]["mean_abs_err"]),
+            -int(item[2]["finite_count"]),
+        )
+    )
+
+    print("variant_scoreboard:")
+    for variant, cpu_output, metrics in scored[:variant_report]:
+        print(
+            f"  {variant.name:28s} "
+            f"max_abs_err={float(metrics['max_abs_err']):.6f} "
+            f"mean_abs_err={float(metrics['mean_abs_err']):.6f} "
+            f"finite={int(metrics['finite_count'])}/{int(metrics['total_count'])} "
+            f"cpu_nonfinite={int(metrics['nonfinite_cpu_count'])} "
+            f"runtime_nonfinite={int(metrics['nonfinite_runtime_count'])}"
+        )
+        print(f"    {variant.description}")
+        print(
+            f"    token={dump_token} prefix="
+            f"{[float(x) for x in cpu_output[:prefix, dump_token]]}"
+        )
+
+    return scored
+
+
+def print_contribution_breakdown(
+    variant: WeightVariant,
+    qweight_u4: np.ndarray,
+    scales: np.ndarray,
+    down_input: np.ndarray,
+    cpu_output: np.ndarray,
+    runtime_output: np.ndarray,
+    dump_token: int,
+    max_report: int,
+    top_terms: int,
+) -> None:
+    finite_mask = np.isfinite(cpu_output) & np.isfinite(runtime_output)
+    if not np.any(finite_mask):
+        print(f"breakdown[{variant.name}]: no finite overlap between cpu and runtime outputs")
+        return
+
+    diff = np.abs(cpu_output - runtime_output)
+    candidate_pos = np.flatnonzero(finite_mask)
+    worst = candidate_pos[np.argsort(diff[finite_mask])[::-1][:max_report]]
+
+    print(f"contribution_breakdown[{variant.name}]:")
+    for pos in worst:
+        row = int(pos // runtime_output.shape[1])
+        col = int(pos % runtime_output.shape[1])
+        q_col = qweight_u4[:, row]
+        w_col = variant.weight_f32[:, row]
+        x_col = down_input[:, col]
+        contrib = w_col * x_col
+        order = np.argsort(np.abs(contrib))[::-1][:top_terms]
+        print(
+            f"  out[{row}, {col}] cpu={float(cpu_output[row, col]):.6f} "
+            f"runtime={float(runtime_output[row, col]):.6f} "
+            f"abs_err={float(diff[row, col]):.6f}"
+        )
+        print(
+            f"    sum_top_terms={float(np.sum(contrib[order])):.6f} "
+            f"sum_all={float(np.sum(contrib)):.6f}"
+        )
+        for kk in order:
+            group = kk // (down_input.shape[0] // scales.shape[0])
+            print(
+                f"    k={int(kk):5d} group={int(group):3d} "
+                f"x={float(x_col[kk]):12.6f} "
+                f"w={float(w_col[kk]):12.6f} "
+                f"q={int(q_col[kk]):2d} "
+                f"zp={int(variant.qzeros_u4[group, row]):2d} "
+                f"scale={float(scales[group, row]):10.6f} "
+                f"contrib={float(contrib[kk]):14.6f}"
             )
 
 
@@ -273,11 +456,10 @@ def main() -> int:
     scales = np.asarray(scales_tensor.data, dtype=np.float32).T.copy()
 
     qweight_u4 = unpack_u4_cols(qweight_packed, size_k, size_n)
-    qzeros_u4 = unpack_u4_cols(qzeros_packed, num_groups, size_n)
-
-    repeated_scales = np.repeat(scales, group_size, axis=0)
-    repeated_qzeros = np.repeat(qzeros_u4.astype(np.float32), group_size, axis=0)
-    weight_f32 = (qweight_u4.astype(np.float32) - repeated_qzeros) * repeated_scales
+    qzeros_u4_plain = unpack_u4_cols(qzeros_packed, num_groups, size_n)
+    weight_variants = make_weight_variants(qweight_u4, qzeros_u4_plain, scales, group_size)
+    baseline_variant = next(variant for variant in weight_variants if variant.name == "plain:awq_zp")
+    weight_f32 = baseline_variant.weight_f32
 
     print(f"GGUF: {gguf_path}")
     print(f"layer={args.layer} size_k={size_k} size_n={size_n} num_groups={num_groups} group_size={group_size}")
@@ -290,7 +472,7 @@ def main() -> int:
     top_cols = args.top_cols
 
     print("qweight_u4[0, :prefix] =", qweight_u4[0, :prefix].tolist())
-    print("qzeros_u4[0, :prefix]  =", qzeros_u4[0, :prefix].tolist())
+    print("qzeros_u4[0, :prefix]  =", qzeros_u4_plain[0, :prefix].tolist())
     print("scales[0, :prefix]     =", [float(x) for x in scales[0, :prefix]])
     print("dequant_w[0, :prefix]  =", [float(x) for x in weight_f32[0, :prefix]])
     print()
@@ -301,7 +483,7 @@ def main() -> int:
     for col in range(top_cols):
         print(
             f"col={col:2d} "
-            f"zp0={int(qzeros_u4[0, col]):2d} "
+            f"zp0={int(qzeros_u4_plain[0, col]):2d} "
             f"scale0={float(scales[0, col]):.6f} "
             f"w_max_abs={float(col_max[col]):.6f} "
             f"w_mean={float(col_mean[col]):.6f} "
@@ -368,6 +550,29 @@ def main() -> int:
             f"runtime_prefix={[float(x) for x in runtime_output[:prefix, args.dump_token]]}"
         )
         summarize_compare(cpu_output, runtime_output, args.max_report)
+        print()
+        scored = print_variant_scoreboard(
+            weight_variants,
+            down_input,
+            runtime_output,
+            args.dump_token,
+            prefix,
+            args.variant_report,
+        )
+        print()
+        for variant, variant_cpu_output, _ in scored[: min(2, len(scored))]:
+            print_contribution_breakdown(
+                variant,
+                qweight_u4,
+                scales,
+                down_input,
+                variant_cpu_output,
+                runtime_output,
+                args.dump_token,
+                args.max_report,
+                args.top_terms,
+            )
+            print()
 
     return 0
 
