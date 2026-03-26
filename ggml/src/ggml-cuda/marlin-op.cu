@@ -63,6 +63,14 @@ static void ggml_cuda_marlin_debug_log_tensor_prefix(
         return;
     }
 
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        oss << " first=<skipped during cuda graph capture>";
+        GGML_LOG_INFO("%s\n", oss.str().c_str());
+        return;
+    }
+
     oss << " first=";
     switch (tensor->type) {
         case GGML_TYPE_F16: {

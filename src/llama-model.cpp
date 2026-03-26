@@ -386,7 +386,6 @@ static void llama_convert_awq_qzeros_to_marlin_cuda(
          7, 15, 23, 31, 39, 47, 55, 63,
     };
     static constexpr std::array<int, 8> k_awq_interleave = { 0, 2, 4, 6, 1, 3, 5, 7 };
-    static constexpr std::array<int, 8> k_awq_undo_interleave = { 0, 4, 1, 5, 2, 6, 3, 7 };
 
     GGML_ASSERT(qzeros != nullptr);
     GGML_ASSERT(backend != nullptr);
@@ -413,21 +412,9 @@ static void llama_convert_awq_qzeros_to_marlin_cuda(
         }
     }
 
-    std::vector<uint32_t> awq_uninterleaved(unpacked.size());
+    std::vector<uint32_t> marlin_permuted(unpacked.size());
     for (int64_t row = 0; row < rows; ++row) {
         const uint32_t * src = unpacked.data() + row * size_n;
-        uint32_t * dst = awq_uninterleaved.data() + row * size_n;
-
-        for (int64_t base = 0; base < size_n; base += (int64_t) k_awq_undo_interleave.size()) {
-            for (size_t i = 0; i < k_awq_undo_interleave.size(); ++i) {
-                dst[base + (int64_t) i] = src[base + (int64_t) k_awq_undo_interleave[i]];
-            }
-        }
-    }
-
-    std::vector<uint32_t> marlin_permuted(awq_uninterleaved.size());
-    for (int64_t row = 0; row < rows; ++row) {
-        const uint32_t * src = awq_uninterleaved.data() + row * size_n;
         uint32_t * dst = marlin_permuted.data() + row * size_n;
 
         for (int64_t base = 0; base < size_n; base += (int64_t) k_scale_perm.size()) {

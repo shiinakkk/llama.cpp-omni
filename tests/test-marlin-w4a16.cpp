@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -165,22 +166,29 @@ std::vector<__half> marlin_permute_scales(const std::vector<float> & scales, int
     return out;
 }
 
-std::vector<uint32_t> marlin_permute_qzeros(const std::vector<uint32_t> & qzeros_awq_packed, int rows, int size_n) {
+std::vector<uint32_t> marlin_permute_qzeros(
+        const std::vector<uint32_t> & qzeros_awq_packed,
+        int rows,
+        int size_n,
+        bool undo_source_interleave,
+        bool output_awq_interleaved) {
     static constexpr std::array<int, 8> kAwqInterleave = {0, 2, 4, 6, 1, 3, 5, 7};
     static constexpr std::array<int, 8> kAwqUndoInterleave = {0, 4, 1, 5, 2, 6, 3, 7};
     const auto scale_perm = get_scale_perm_grouped();
 
     std::vector<uint32_t> unpacked = unpack_u4_rows(qzeros_awq_packed, rows, size_n);
-    std::vector<uint32_t> awq_uninterleaved(unpacked.size());
+    std::vector<uint32_t> awq_uninterleaved = unpacked;
     std::vector<uint32_t> marlin_permuted(unpacked.size());
     std::vector<uint32_t> marlin_interleaved(unpacked.size());
 
-    for (int row = 0; row < rows; ++row) {
-        const uint32_t * src = unpacked.data() + row * size_n;
-        uint32_t * dst = awq_uninterleaved.data() + row * size_n;
-        for (int base = 0; base < size_n; base += static_cast<int>(kAwqUndoInterleave.size())) {
-            for (size_t i = 0; i < kAwqUndoInterleave.size(); ++i) {
-                dst[base + static_cast<int>(i)] = src[base + kAwqUndoInterleave[i]];
+    if (undo_source_interleave) {
+        for (int row = 0; row < rows; ++row) {
+            const uint32_t * src = unpacked.data() + row * size_n;
+            uint32_t * dst = awq_uninterleaved.data() + row * size_n;
+            for (int base = 0; base < size_n; base += static_cast<int>(kAwqUndoInterleave.size())) {
+                for (size_t i = 0; i < kAwqUndoInterleave.size(); ++i) {
+                    dst[base + static_cast<int>(i)] = src[base + kAwqUndoInterleave[i]];
+                }
             }
         }
     }
@@ -195,20 +203,32 @@ std::vector<uint32_t> marlin_permute_qzeros(const std::vector<uint32_t> & qzeros
         }
     }
 
-    for (int row = 0; row < rows; ++row) {
-        const uint32_t * src = marlin_permuted.data() + row * size_n;
-        uint32_t * dst = marlin_interleaved.data() + row * size_n;
-        for (int base = 0; base < size_n; base += static_cast<int>(kAwqInterleave.size())) {
-            for (size_t i = 0; i < kAwqInterleave.size(); ++i) {
-                dst[base + static_cast<int>(i)] = src[base + kAwqInterleave[i]];
+    if (output_awq_interleaved) {
+        for (int row = 0; row < rows; ++row) {
+            const uint32_t * src = marlin_permuted.data() + row * size_n;
+            uint32_t * dst = marlin_interleaved.data() + row * size_n;
+            for (int base = 0; base < size_n; base += static_cast<int>(kAwqInterleave.size())) {
+                for (size_t i = 0; i < kAwqInterleave.size(); ++i) {
+                    dst[base + static_cast<int>(i)] = src[base + kAwqInterleave[i]];
+                }
             }
         }
+    } else {
+        marlin_interleaved = marlin_permuted;
     }
 
     return pack_u4_rows(marlin_interleaved, rows, size_n);
 }
 
-std::vector<uint32_t> pack_awq_qzeros_source(const std::vector<uint32_t> & logical_qzeros, int rows, int size_n) {
+std::vector<uint32_t> pack_qzeros_source(
+        const std::vector<uint32_t> & logical_qzeros,
+        int rows,
+        int size_n,
+        bool awq_interleaved_source) {
+    if (!awq_interleaved_source) {
+        return pack_u4_rows(logical_qzeros, rows, size_n);
+    }
+
     static constexpr std::array<int, 8> kAwqInterleave = {0, 2, 4, 6, 1, 3, 5, 7};
 
     std::vector<uint32_t> awq_interleaved(logical_qzeros.size());
@@ -233,7 +253,21 @@ struct TestCase {
     int group_size;
     bool use_qzeros;
     bool use_grouped_scale_perm;
+    bool qzeros_source_awq_interleaved;
+    bool qzeros_output_awq_interleaved;
 };
+
+float allowed_error(const TestCase & tc, float want) {
+    const float abs_want = std::fabs(want);
+    float tol = 2e-2f;
+
+    if (tc.k >= 4096 || tc.n >= 1024) {
+        tol = std::max(tol, 2e-3f * abs_want);
+        tol = std::max(tol, 5e-1f);
+    }
+
+    return tol;
+}
 
 struct DeviceBuffers {
     __half * d_a = nullptr;
@@ -304,7 +338,11 @@ void run_test_case(int device, const TestCase & tc) {
                 qzeros_logical[group * tc.n + col] = static_cast<uint32_t>((group * 5 + col * 9 + 2) & 0xF);
             }
         }
-        qzeros_awq_packed = pack_awq_qzeros_source(qzeros_logical, num_groups, tc.n);
+        qzeros_awq_packed = pack_qzeros_source(
+                qzeros_logical,
+                num_groups,
+                tc.n,
+                tc.qzeros_source_awq_interleaved);
     }
 
     for (int row = 0; row < tc.m; ++row) {
@@ -327,7 +365,12 @@ void run_test_case(int device, const TestCase & tc) {
     const std::vector<__half> packed_scales_host =
             marlin_permute_scales(scales_host, num_groups, tc.n, tc.use_grouped_scale_perm);
     const std::vector<uint32_t> packed_qzeros_host = tc.use_qzeros
-            ? marlin_permute_qzeros(qzeros_awq_packed, num_groups, tc.n)
+            ? marlin_permute_qzeros(
+                    qzeros_awq_packed,
+                    num_groups,
+                    tc.n,
+                    tc.qzeros_source_awq_interleaved,
+                    tc.qzeros_output_awq_interleaved)
             : std::vector<uint32_t>();
 
     DeviceBuffers buffers;
@@ -406,11 +449,27 @@ void run_test_case(int device, const TestCase & tc) {
                 throw std::runtime_error(tc.name + ": output contains non-finite values");
             }
             max_abs_err = std::max(max_abs_err, std::fabs(got - want));
-            if (std::fabs(got - want) > 2e-2f) {
+            const float tol = allowed_error(tc, want);
+            if (std::fabs(got - want) > tol) {
+                const int row = i / tc.n;
+                const int col = i % tc.n;
+                std::ostringstream detail;
+                detail << tc.name << ": mismatch at " << i
+                       << " row=" << row
+                       << " col=" << col
+                       << " got=" << got
+                       << " want=" << want
+                       << " tol=" << tol;
+                if (tc.use_qzeros) {
+                    const int ref_group = 0;
+                    detail << " scale=" << scales_host[ref_group * tc.n + col]
+                           << " zp=" << qzeros_logical[ref_group * tc.n + col]
+                           << " q0=" << q_w_host[col]
+                           << " qzeros_source_awq_interleaved=" << (tc.qzeros_source_awq_interleaved ? 1 : 0)
+                           << " qzeros_output_awq_interleaved=" << (tc.qzeros_output_awq_interleaved ? 1 : 0);
+                }
                 throw std::runtime_error(
-                        tc.name + ": mismatch at " + std::to_string(i) +
-                        " got=" + std::to_string(got) +
-                        " want=" + std::to_string(want));
+                        detail.str());
             }
         }
 
@@ -450,23 +509,39 @@ int main() {
     }
 
     std::vector<TestCase> cases = {
-        {"single_group_scales", 16, 64, 128, -1, false, false},
-        {"grouped_scales", 16, 64, 128, 32, false, true},
+        {"single_group_scales", 16, 64, 128, -1, false, false, false, false},
+        {"grouped_scales", 16, 64, 128, 32, false, true, false, false},
     };
 
     const bool run_qzeros_probe = std::getenv("LLAMA_MARLIN_RUN_QZEROS_PROBE") != nullptr;
     if (run_qzeros_probe) {
-        cases.push_back({"grouped_scales_qzeros", 16, 64, 128, 32, true, true});
+        cases.push_back({"grouped_scales_qzeros_src_awq_out_awq", 16, 64, 128, 32, true, true, true, true});
+        cases.push_back({"grouped_scales_qzeros_src_plain_out_awq", 16, 64, 128, 32, true, true, false, true});
+        cases.push_back({"grouped_scales_qzeros_src_awq_out_plain", 16, 64, 128, 32, true, true, true, false});
+        cases.push_back({"grouped_scales_qzeros_src_plain_out_plain", 16, 64, 128, 32, true, true, false, false});
     } else {
         std::cout << "SKIP: grouped_scales_qzeros probe is disabled by default; set LLAMA_MARLIN_RUN_QZEROS_PROBE=1 to run it\n";
     }
 
-    try {
-        for (const TestCase & tc : cases) {
+    const bool run_large_shape_probe = std::getenv("LLAMA_MARLIN_RUN_LARGE_SHAPE_PROBE") != nullptr;
+    if (run_large_shape_probe) {
+        cases.push_back({"grouped_scales_large_shape", 15, 4096, 12288, 128, false, true, false, false});
+        cases.push_back({"grouped_scales_qzeros_large_shape_src_plain_out_awq", 15, 4096, 12288, 128, true, true, false, true});
+    } else {
+        std::cout << "SKIP: large-shape Marlin probe is disabled by default; set LLAMA_MARLIN_RUN_LARGE_SHAPE_PROBE=1 to run it\n";
+    }
+
+    bool had_failure = false;
+    for (const TestCase & tc : cases) {
+        try {
             run_test_case(device, tc);
+        } catch (const std::exception & err) {
+            had_failure = true;
+            std::cerr << err.what() << '\n';
         }
-    } catch (const std::exception & err) {
-        std::cerr << err.what() << '\n';
+    }
+
+    if (had_failure) {
         return 1;
     }
 
