@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <sstream>
 #include <stdexcept>
 
@@ -18,6 +20,105 @@
 static bool llama_debug_tensor_should_log(const ggml_tensor * t) {
     const char * name = ggml_get_name(t);
     return name != nullptr && name[0] != '\0';
+}
+
+static const char * llama_debug_tensor_dump_dir() {
+    const char * value = std::getenv("LLAMA_DEBUG_TENSOR_DUMP_DIR");
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+static bool llama_debug_tensor_should_dump(const ggml_tensor * t) {
+    if (t == nullptr || llama_debug_tensor_dump_dir() == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(t);
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    const char * filter = std::getenv("LLAMA_DEBUG_TENSOR_DUMP_FILTER");
+    if (filter == nullptr || filter[0] == '\0') {
+        return true;
+    }
+
+    std::string filter_copy(filter);
+    size_t start = 0;
+    while (start <= filter_copy.size()) {
+        size_t end = filter_copy.find(',', start);
+        std::string token = filter_copy.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        token.erase(0, token.find_first_not_of(" \t"));
+        token.erase(token.find_last_not_of(" \t") + 1);
+        if (!token.empty() && std::strstr(name, token.c_str()) != nullptr) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return false;
+}
+
+static std::string llama_debug_tensor_sanitize_name(const char * name) {
+    std::string out = name != nullptr ? name : "unnamed";
+    for (char & ch : out) {
+        const bool ok = (ch >= 'a' && ch <= 'z') ||
+                        (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') ||
+                        ch == '.' || ch == '_' || ch == '-';
+        if (!ok) {
+            ch = '_';
+        }
+    }
+    return out;
+}
+
+static void llama_debug_tensor_dump_full(const ggml_tensor * t) {
+    if (!llama_debug_tensor_should_dump(t)) {
+        return;
+    }
+
+    const char * dump_dir = llama_debug_tensor_dump_dir();
+    const char * name = ggml_get_name(t);
+    const std::string safe_name = llama_debug_tensor_sanitize_name(name);
+    const std::string shape = std::to_string(t->ne[0]) + "x" +
+            std::to_string(t->ne[1]) + "x" +
+            std::to_string(t->ne[2]) + "x" +
+            std::to_string(t->ne[3]);
+    const std::string base = std::string(dump_dir) + "/" + safe_name + "__" +
+            ggml_op_name(t->op) + "__" + ggml_type_name(t->type) + "__" + shape;
+
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+
+    {
+        std::ofstream bin(base + ".bin", std::ios::binary);
+        if (!bin) {
+            LLAMA_LOG_WARN("%s: failed to open tensor dump '%s.bin'\n", __func__, base.c_str());
+            return;
+        }
+        bin.write(reinterpret_cast<const char *>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    }
+
+    {
+        std::ofstream meta(base + ".meta");
+        if (!meta) {
+            LLAMA_LOG_WARN("%s: failed to open tensor metadata dump '%s.meta'\n", __func__, base.c_str());
+            return;
+        }
+        meta << "name=" << (name != nullptr ? name : "<unnamed>") << "\n";
+        meta << "op=" << ggml_op_name(t->op) << "\n";
+        meta << "type=" << ggml_type_name(t->type) << "\n";
+        meta << "ne0=" << t->ne[0] << "\n";
+        meta << "ne1=" << t->ne[1] << "\n";
+        meta << "ne2=" << t->ne[2] << "\n";
+        meta << "ne3=" << t->ne[3] << "\n";
+        meta << "nbytes=" << raw.size() << "\n";
+    }
+
+    LLAMA_LOG_INFO("DEBUG_TENSOR: dumped=%s.bin nbytes=%zu\n", base.c_str(), raw.size());
 }
 
 static void tensor_log_n(const ggml_tensor * t, int n) {
@@ -108,6 +209,7 @@ static void tensor_log_n(const ggml_tensor * t, int n) {
     }
 
     LLAMA_LOG_INFO("%s\n", oss.str().c_str());
+    llama_debug_tensor_dump_full(t);
 }
 
 bool llama_debug_tensor_eval_trampoline(struct ggml_tensor * t, bool ask, void * user_data) {
