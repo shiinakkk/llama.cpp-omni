@@ -245,6 +245,36 @@ std::vector<uint32_t> pack_qzeros_source(
     return pack_u4_rows(awq_interleaved, rows, size_n);
 }
 
+std::vector<float> shift_group_axis_clamp(
+        const std::vector<float> & values,
+        int rows,
+        int cols,
+        int offset) {
+    if (offset == 0) {
+        return values;
+    }
+
+    std::vector<float> shifted(values.size());
+    if (offset > 0) {
+        for (int row = 0; row < offset; ++row) {
+            std::copy_n(values.data(), cols, shifted.data() + row * cols);
+        }
+        for (int row = offset; row < rows; ++row) {
+            std::copy_n(values.data() + (row - offset) * cols, cols, shifted.data() + row * cols);
+        }
+    } else {
+        const int neg_offset = -offset;
+        for (int row = 0; row < rows - neg_offset; ++row) {
+            std::copy_n(values.data() + (row + neg_offset) * cols, cols, shifted.data() + row * cols);
+        }
+        for (int row = rows - neg_offset; row < rows; ++row) {
+            std::copy_n(values.data() + (rows - 1) * cols, cols, shifted.data() + row * cols);
+        }
+    }
+
+    return shifted;
+}
+
 struct TestCase {
     std::string name;
     int m;
@@ -293,6 +323,44 @@ float dequant_awq_value(uint32_t q, float scale, uint32_t zero) {
 
 float dequant_no_zp_value(uint32_t q, float scale) {
     return (static_cast<float>(q) - 8.0f) * scale;
+}
+
+std::vector<float> build_reference_output(
+        const TestCase & tc,
+        const std::vector<__half> & a_host,
+        const std::vector<uint32_t> & q_w_host,
+        const std::vector<float> & scales_host,
+        const std::vector<uint32_t> & qzeros_logical,
+        int scale_group_offset) {
+    const int num_groups = tc.group_size > 0 ? tc.k / tc.group_size : 1;
+    const std::vector<float> shifted_scales = shift_group_axis_clamp(scales_host, num_groups, tc.n, scale_group_offset);
+    std::vector<float> ref_host(tc.m * tc.n, 0.0f);
+
+    for (int row = 0; row < tc.m; ++row) {
+        for (int col = 0; col < tc.n; ++col) {
+            float acc = 0.0f;
+            for (int kk = 0; kk < tc.k; ++kk) {
+                const int group = tc.group_size > 0 ? kk / tc.group_size : 0;
+                const float scale = shifted_scales[group * tc.n + col];
+                const uint32_t q = q_w_host[kk * tc.n + col];
+                const float w = tc.use_qzeros
+                        ? dequant_awq_value(q, scale, qzeros_logical[group * tc.n + col])
+                        : dequant_no_zp_value(q, scale);
+                acc += __half2float(a_host[row * tc.k + kk]) * w;
+            }
+            ref_host[row * tc.n + col] = acc;
+        }
+    }
+
+    return ref_host;
+}
+
+float compute_max_abs_err(const std::vector<__half> & got, const std::vector<float> & want) {
+    float max_abs_err = 0.0f;
+    for (size_t i = 0; i < got.size(); ++i) {
+        max_abs_err = std::max(max_abs_err, std::fabs(__half2float(got[i]) - want[i]));
+    }
+    return max_abs_err;
 }
 
 void run_test_case(int device, const TestCase & tc) {
@@ -486,6 +554,130 @@ void run_test_case(int device, const TestCase & tc) {
     free_device_buffers(buffers);
 }
 
+void run_scale_group_alignment_probe(int device) {
+    const TestCase tc{"scale_group_alignment_probe", 15, 4096, 12288, 128, true, true, false, true};
+    const int num_groups = tc.k / tc.group_size;
+
+    std::vector<__half> a_host(tc.m * tc.k);
+    std::vector<uint32_t> q_w_host(tc.k * tc.n);
+    std::vector<float> scales_host(num_groups * tc.n);
+    std::vector<uint32_t> qzeros_logical(num_groups * tc.n);
+
+    for (int row = 0; row < tc.m; ++row) {
+        for (int col = 0; col < tc.k; ++col) {
+            const float value = float(((row * 11 + col * 7 + 3) % 23) - 11) * 0.125f;
+            a_host[row * tc.k + col] = __float2half(value);
+        }
+    }
+    for (int row = 0; row < tc.k; ++row) {
+        for (int col = 0; col < tc.n; ++col) {
+            q_w_host[row * tc.n + col] = static_cast<uint32_t>((row * 13 + col * 5 + 7) & 0xF);
+        }
+    }
+    for (int group = 0; group < num_groups; ++group) {
+        for (int col = 0; col < tc.n; ++col) {
+            scales_host[group * tc.n + col] = 0.03125f * float(1 + ((group * 7 + col * 3 + 5) % 11));
+            qzeros_logical[group * tc.n + col] = static_cast<uint32_t>((group * 5 + col * 9 + 2) & 0xF);
+        }
+    }
+
+    const std::vector<uint32_t> qzeros_awq_packed = pack_qzeros_source(qzeros_logical, num_groups, tc.n, tc.qzeros_source_awq_interleaved);
+    const std::vector<uint32_t> packed_b_host = marlin_pack_u4_weights(q_w_host, tc.k, tc.n);
+    const std::vector<__half> packed_scales_host = marlin_permute_scales(scales_host, num_groups, tc.n, tc.use_grouped_scale_perm);
+    const std::vector<uint32_t> packed_qzeros_host = marlin_permute_qzeros(
+            qzeros_awq_packed,
+            num_groups,
+            tc.n,
+            tc.qzeros_source_awq_interleaved,
+            tc.qzeros_output_awq_interleaved);
+
+    DeviceBuffers buffers;
+    ggml_context * ctx = nullptr;
+    try {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_a), a_host.size() * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_b), packed_b_host.size() * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_scales), packed_scales_host.size() * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_qzeros), packed_qzeros_host.size() * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_c), tc.m * tc.n * sizeof(__half)));
+        const int workspace_elems = ggml_cuda_marlin_min_workspace_elements(device);
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&buffers.d_workspace), workspace_elems * sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(buffers.d_a, a_host.data(), a_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_b, packed_b_host.data(), packed_b_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_scales, packed_scales_host.data(), packed_scales_host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_qzeros, packed_qzeros_host.data(), packed_qzeros_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(buffers.d_c, 0, tc.m * tc.n * sizeof(__half)));
+        CUDA_CHECK(cudaMemset(buffers.d_workspace, 0, workspace_elems * sizeof(int)));
+
+        ggml_init_params ggml_params = {
+            /*.mem_size   =*/ 1 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx = ggml_init(ggml_params);
+        if (ctx == nullptr) {
+            throw std::runtime_error("scale_group_alignment_probe: ggml_init failed");
+        }
+
+        ggml_tensor * a_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tc.k, tc.m);
+        ggml_tensor * b_qweight_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, tc.k, tc.n / kPackFactor);
+        ggml_tensor * b_scales_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, num_groups, tc.n);
+        ggml_tensor * b_qzeros_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, num_groups, tc.n / kPackFactor);
+        ggml_tensor * c_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tc.n, tc.m);
+        ggml_tensor * workspace_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, workspace_elems);
+
+        a_tensor->data = buffers.d_a;
+        b_qweight_tensor->data = buffers.d_b;
+        b_scales_tensor->data = buffers.d_scales;
+        b_qzeros_tensor->data = buffers.d_qzeros;
+        c_tensor->data = buffers.d_c;
+        workspace_tensor->data = buffers.d_workspace;
+
+        if (!ggml_cuda_marlin_w4a16_gemm(
+                    a_tensor,
+                    b_qweight_tensor,
+                    b_scales_tensor,
+                    b_qzeros_tensor,
+                    c_tensor,
+                    workspace_tensor,
+                    device,
+                    nullptr)) {
+            throw std::runtime_error("scale_group_alignment_probe: ggml_cuda_marlin_w4a16_gemm returned false");
+        }
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<__half> c_host(tc.m * tc.n);
+        CUDA_CHECK(cudaMemcpy(c_host.data(), buffers.d_c, c_host.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+
+        const std::vector<float> ref_g0 = build_reference_output(tc, a_host, q_w_host, scales_host, qzeros_logical, 0);
+        const std::vector<float> ref_gm1 = build_reference_output(tc, a_host, q_w_host, scales_host, qzeros_logical, -1);
+        const std::vector<float> ref_gp1 = build_reference_output(tc, a_host, q_w_host, scales_host, qzeros_logical, +1);
+
+        const float err_g0 = compute_max_abs_err(c_host, ref_g0);
+        const float err_gm1 = compute_max_abs_err(c_host, ref_gm1);
+        const float err_gp1 = compute_max_abs_err(c_host, ref_gp1);
+
+        std::cout << "scale_group_alignment_probe"
+                  << " err_g-1=" << err_gm1
+                  << " err_g0=" << err_g0
+                  << " err_g+1=" << err_gp1 << '\n';
+
+        if (!(err_g0 < err_gm1 && err_g0 < err_gp1)) {
+            throw std::runtime_error("scale_group_alignment_probe: kernel output is not closest to baseline scale grouping");
+        }
+    } catch (...) {
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+        free_device_buffers(buffers);
+        throw;
+    }
+
+    ggml_free(ctx);
+    free_device_buffers(buffers);
+}
+
 } // namespace
 
 int main() {
@@ -513,6 +705,8 @@ int main() {
         {"grouped_scales", 16, 64, 128, 32, false, true, false, false},
     };
 
+    bool had_failure = false;
+
     const bool run_qzeros_probe = std::getenv("LLAMA_MARLIN_RUN_QZEROS_PROBE") != nullptr;
     if (run_qzeros_probe) {
         cases.push_back({"grouped_scales_qzeros_src_awq_out_awq", 16, 64, 128, 32, true, true, true, true});
@@ -531,7 +725,18 @@ int main() {
         std::cout << "SKIP: large-shape Marlin probe is disabled by default; set LLAMA_MARLIN_RUN_LARGE_SHAPE_PROBE=1 to run it\n";
     }
 
-    bool had_failure = false;
+    const bool enable_scale_group_alignment_probe = std::getenv("LLAMA_MARLIN_RUN_SCALE_GROUP_ALIGNMENT_PROBE") != nullptr;
+    if (enable_scale_group_alignment_probe) {
+        try {
+            run_scale_group_alignment_probe(device);
+        } catch (const std::exception & err) {
+            had_failure = true;
+            std::cerr << err.what() << '\n';
+        }
+    } else {
+        std::cout << "SKIP: scale-group alignment probe is disabled by default; set LLAMA_MARLIN_RUN_SCALE_GROUP_ALIGNMENT_PROBE=1 to run it\n";
+    }
+
     for (const TestCase & tc : cases) {
         try {
             run_test_case(device, tc);
