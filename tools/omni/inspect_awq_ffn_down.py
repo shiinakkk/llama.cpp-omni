@@ -204,7 +204,8 @@ def load_dump_tensor(record: DumpTensorRecord) -> np.ndarray:
         raise ValueError(f"dump size mismatch for {record.path}: got {raw.size}, expected {expected}")
     if record.ggml_type == "bf16":
         raw = (raw.astype(np.uint32) << 16).view(np.float32)
-    return raw.reshape(record.shape[3], record.shape[2], record.shape[1], record.shape[0])[0, 0]
+    tensor = raw.reshape(record.shape[3], record.shape[2], record.shape[1], record.shape[0]).transpose(3, 2, 1, 0)
+    return tensor[:, :, 0, 0]
 
 
 def summarize_compare(cpu: np.ndarray, runtime: np.ndarray, max_report: int) -> None:
