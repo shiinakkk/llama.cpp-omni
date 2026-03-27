@@ -20,6 +20,7 @@
 #include <array>
 #include <cassert>
 #include <charconv>
+#include <cstdint>
 #include <cmath>
 #include <cfloat>
 #include <cstdlib>
@@ -53,6 +54,18 @@ static bool llama_awq_marlin_debug_match_name(const char * name) {
         return false;
     }
 
+    const char * pattern = std::getenv("LLAMA_AWQ_MARLIN_DEBUG_PATTERN");
+    if (pattern != nullptr && pattern[0] != '\0') {
+        return std::strstr(name, pattern) != nullptr;
+    }
+
+    // Default: capture all AWQ triplet tensors (attention + MLP, all layers)
+    if (std::strstr(name, ".qweight") != nullptr ||
+        std::strstr(name, ".qzeros")  != nullptr ||
+        std::strstr(name, ".scales")  != nullptr) {
+        return true;
+    }
+
     if (std::strstr(name, "layers.2.mlp.gate_proj") != nullptr) {
         return true;
     }
@@ -64,6 +77,20 @@ static bool llama_awq_marlin_debug_match_name(const char * name) {
     }
 
     return false;
+}
+
+static bool llama_awq_marlin_debug_hash_full_enabled() {
+    const char * value = std::getenv("LLAMA_AWQ_MARLIN_DEBUG_HASH_FULL");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static uint64_t llama_fnv1a64(const uint8_t * data, size_t size) {
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 static void llama_awq_marlin_debug_dump_tensor(const char * stage, const ggml_tensor * tensor, int64_t limit = 8) {
@@ -162,6 +189,14 @@ static void llama_awq_marlin_debug_dump_tensor(const char * stage, const ggml_te
         default:
             oss << " first=<unsupported>";
             break;
+    }
+
+    if (llama_awq_marlin_debug_hash_full_enabled()) {
+        const size_t nbytes = ggml_nbytes(tensor);
+        std::vector<uint8_t> raw(nbytes);
+        ggml_backend_tensor_get(tensor, raw.data(), 0, nbytes);
+        const uint64_t h = llama_fnv1a64(raw.data(), raw.size());
+        oss << " full_fnv1a64=0x" << std::hex << h << std::dec << " nbytes=" << nbytes;
     }
 
     LLAMA_LOG_INFO("%s\n", oss.str().c_str());
@@ -599,6 +634,18 @@ static void llama_repack_qwen3_awq_tensors_to_marlin(llama_model & model, std::v
 
         int device = 0;
         ggml_backend_ptr backend { llama_init_cuda_backend_for_tensor(qweight, &device) };
+
+        // Offline-converted Marlin GGUF already stores AWQ triplets in Marlin layout:
+        // - qweight/qzeros are repacked
+        // - scales are permuted and materialized as F16.
+        // In this case we only ensure tensors are resident on CUDA to keep MARLIN_W4A16
+        // scheduled on GPU, and skip runtime transforms.
+        if (scales->type == GGML_TYPE_F16) {
+            llama_rehome_tensor_to_cuda(qweight, backend.get(), owned_buffers);
+            llama_rehome_tensor_to_cuda(qzeros,  backend.get(), owned_buffers);
+            llama_rehome_tensor_to_cuda(scales,  backend.get(), owned_buffers);
+            return;
+        }
 
         // AWQ triplets were exported with .T to satisfy gguf/ggml shape semantics.
         // Restore to the original HF logical layout before applying vLLM marlin transforms.
