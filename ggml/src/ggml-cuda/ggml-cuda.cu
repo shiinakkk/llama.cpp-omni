@@ -2001,6 +2001,10 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    static const bool trace_mmvf = []() {
+        const char * value = std::getenv("LLAMA_CUDA_TRACE_MMVF");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2060,6 +2064,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
     if (!split && use_mul_mat_vec_f) {
+        if (trace_mmvf) {
+            GGML_LOG_INFO("%s: using mul_mat_vec_f src0='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst='%s' ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    __func__,
+                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        }
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -2074,6 +2085,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // general KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        if (trace_mmvf) {
+            GGML_LOG_INFO("%s: using split/op mul_mat_vec_f src0='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst='%s' ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    __func__,
+                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);

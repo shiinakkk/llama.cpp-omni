@@ -37,6 +37,9 @@ endif()
 
 target_link_libraries     (omni PUBLIC ggml llama common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
+if (UNIX AND NOT APPLE)
+    target_link_libraries (omni PRIVATE dl)
+endif()
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
@@ -92,10 +95,12 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
+if (UNIX AND NOT APPLE)
+    target_link_libraries(${TARGET} PRIVATE dl)
+endif()
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
 # target_compile_features(token2wav-example PRIVATE cxx_std_17)
-

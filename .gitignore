@@ -133,6 +133,7 @@ zig-cache/
 
 # Logs
 
+/log/
 ppl-*.txt
 qnt-*.txt
 perf-*.txt

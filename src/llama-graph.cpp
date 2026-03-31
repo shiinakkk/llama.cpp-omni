@@ -657,11 +657,6 @@ ggml_tensor * llm_graph_context::build_awq_marlin_mm(
     ggml_tensor * res = ggml_marlin_w4a16(ctx0, cur, qweight, scales, qzeros, workspace);
     cb(res, "awq_marlin_mm", il);
 
-    if (res->type != GGML_TYPE_F32) {
-        res = ggml_cast(ctx0, res, GGML_TYPE_F32);
-        cb(res, "awq_marlin_mm_f32", il);
-    }
-
     return res;
 }
 
@@ -699,6 +694,11 @@ ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * mb,
        llm_norm_type   type,
                  int   il) const {
+    // CUDA norm/fused-norm paths currently assume F32 source tensors.
+    if (cur->type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    }
+
     switch (type) {
         case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
@@ -1601,8 +1601,19 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * k_store = k_cur;
+        ggml_tensor * v_store = v_cur;
+
+        // KV cache set_rows path currently requires F32 source tensors.
+        if (k_store->type != GGML_TYPE_F32) {
+            k_store = ggml_cast(ctx0, k_store, GGML_TYPE_F32);
+        }
+        if (v_store->type != GGML_TYPE_F32) {
+            v_store = ggml_cast(ctx0, v_store, GGML_TYPE_F32);
+        }
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_store, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();

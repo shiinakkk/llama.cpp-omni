@@ -20,6 +20,12 @@
 #include <cstring>
 #include <vector>
 
+#ifdef GGML_USE_CUDA
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#include <dlfcn.h>
+#endif
+#endif
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -35,6 +41,54 @@
 // volatile, because of signal being an interrupt
 static volatile bool g_is_generating = false;
 static volatile bool g_is_interrupted = false;
+
+struct omni_nvtx_scope {
+#ifdef GGML_USE_CUDA
+    using nvtx_push_fn = int (*)(const char *);
+    using nvtx_pop_fn = int (*)();
+
+    static nvtx_push_fn get_push() {
+        static nvtx_push_fn fn = []() -> nvtx_push_fn {
+            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (!h) {
+                return nullptr;
+            }
+            return reinterpret_cast<nvtx_push_fn>(dlsym(h, "nvtxRangePushA"));
+        }();
+        return fn;
+    }
+
+    static nvtx_pop_fn get_pop() {
+        static nvtx_pop_fn fn = []() -> nvtx_pop_fn {
+            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (!h) {
+                return nullptr;
+            }
+            return reinterpret_cast<nvtx_pop_fn>(dlsym(h, "nvtxRangePop"));
+        }();
+        return fn;
+    }
+
+    explicit omni_nvtx_scope(const char * name) : active(false) {
+        if (auto push = get_push()) {
+            push(name);
+            active = true;
+        }
+    }
+
+    ~omni_nvtx_scope() {
+        if (active) {
+            if (auto pop = get_pop()) {
+                pop();
+            }
+        }
+    }
+
+    bool active;
+#else
+    explicit omni_nvtx_scope(const char * /*name*/) {}
+#endif
+};
 
 /**
  * Please note that this is NOT a production-ready stuff.
@@ -184,6 +238,7 @@ void test_case(struct omni_context *ctx_omni, common_params& params, std::string
         auto t0 = std::chrono::high_resolution_clock::now();
         // index 从 0 开始，第一次 prefill (index=0) 初始化系统 prompt
         // 后续 prefill 在同步模式下直接添加到 KV cache
+        omni_nvtx_scope nvtx_stream_prefill("omni.stream_prefill");
         stream_prefill(ctx_omni, aud_fname, img_fname, il);
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed_seconds = t1 - t0;

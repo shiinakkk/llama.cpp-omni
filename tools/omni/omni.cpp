@@ -63,6 +63,9 @@
     #include <sys/wait.h>
     #include <unistd.h>
     #include <dirent.h>
+#ifdef GGML_USE_CUDA
+    #include <dlfcn.h>
+#endif
 #endif
 
 // ============================================================
@@ -137,6 +140,54 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
 // Forward declarations
 //
 void print_with_timestamp(const char* format, ...);
+
+struct omni_nvtx_scope {
+#ifdef GGML_USE_CUDA
+    using nvtx_push_fn = int (*)(const char *);
+    using nvtx_pop_fn = int (*)();
+
+    static nvtx_push_fn get_push() {
+        static nvtx_push_fn fn = []() -> nvtx_push_fn {
+            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (!h) {
+                return nullptr;
+            }
+            return reinterpret_cast<nvtx_push_fn>(dlsym(h, "nvtxRangePushA"));
+        }();
+        return fn;
+    }
+
+    static nvtx_pop_fn get_pop() {
+        static nvtx_pop_fn fn = []() -> nvtx_pop_fn {
+            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (!h) {
+                return nullptr;
+            }
+            return reinterpret_cast<nvtx_pop_fn>(dlsym(h, "nvtxRangePop"));
+        }();
+        return fn;
+    }
+
+    explicit omni_nvtx_scope(const char * name) : active(false) {
+        if (auto push = get_push()) {
+            push(name);
+            active = true;
+        }
+    }
+
+    ~omni_nvtx_scope() {
+        if (active) {
+            if (auto pop = get_pop()) {
+                pop();
+            }
+        }
+    }
+
+    bool active;
+#else
+    explicit omni_nvtx_scope(const char * /*name*/) {}
+#endif
+};
 
 // ==================== 特殊 Token 分类 ====================
 // 
@@ -298,11 +349,13 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (omni_embed->embed + i*n_embd);
+        std::vector<int8_t> logits_vec(n_eval, false);
         std::vector<llama_pos> pos_vec(n_eval);
         for (int j = 0; j < n_eval; j++) {
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
+        batch.logits = logits_vec.data();
         
         if (llama_decode(ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
@@ -314,6 +367,7 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
 }
 
 bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, float* embed, int n_pos, int n_batch, int*n_past) {
+    omni_nvtx_scope nvtx_prefill_total("omni.prefill_with_emb.total");
     kv_cache_slide_window(ctx_omni, params, n_pos);
     
     int n_embd  = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
@@ -325,12 +379,15 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (embed + i*n_embd);
+        std::vector<int8_t> logits_vec(n_eval, false);
         std::vector<llama_pos> pos_vec(n_eval);
         for (int j = 0; j < n_eval; j++) {
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
+        batch.logits = logits_vec.data();
         
+        omni_nvtx_scope nvtx_prefill_decode("omni.prefill_with_emb.llama_decode");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
@@ -818,7 +875,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
     print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past 从 %d 减少到 %d\n", old_n_past, ctx_omni->n_past);
 }
 
-static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
+static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false, bool need_logits = true) {
     int N = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, N);
 
@@ -834,10 +891,15 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
         }
         // llama_batch_get_one 返回的 batch.pos 可能是 nullptr，需要手动设置
         llama_batch batch = llama_batch_get_one(&tokens[i], n_eval);
+        std::vector<int8_t> logits_vec;
         std::vector<llama_pos> pos_vec;
         if (batch.pos == nullptr) {
             pos_vec.resize(n_eval);
             batch.pos = pos_vec.data();
+        }
+        if (!need_logits) {
+            logits_vec.assign(n_eval, false);
+            batch.logits = logits_vec.data();
         }
         for (int j = 0; j < n_eval; j++) {
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
@@ -933,10 +995,10 @@ static bool eval_id_with_hidden(struct omni_context * ctx_omni, common_params* p
     return eval_tokens_with_hidden(ctx_omni, params, tokens, 1, n_past, hidden_states);
 }
 
-static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false) {
+static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false, bool need_logits = true) {
     std::string              str2     = str;
     std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
-    return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb);
+    return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb, need_logits);
 }
 
 static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, float *& hidden_states) {
@@ -8784,19 +8846,32 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // 双工模式：参考音频需要送入 LLM
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+            {
+                omni_nvtx_scope nvtx_prefill_text_prefix("omni.stream_prefill.system_prompt.text_prefix");
+                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+            }
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
-            auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+            omni_embed * audio_embeds = nullptr;
+            {
+                omni_nvtx_scope nvtx_ref_audio_embed("omni.stream_prefill.system_prompt.ref_audio.embed");
+                audio_embeds = omni_audio_embed_make_with_filename(
+                    ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+            }
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
-                prefill_with_emb(ctx_omni, ctx_omni->params, audio_embeds->embed, audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
+                omni_nvtx_scope nvtx_ref_audio_prefill("omni.stream_prefill.system_prompt.ref_audio.prefill");
+                prefill_with_emb(ctx_omni, ctx_omni->params, audio_embeds->embed, audio_embeds->n_pos,
+                                 ctx_omni->params->n_batch, &ctx_omni->n_past);
+            }
+            if (audio_embeds != nullptr) {
                 omni_embed_free(audio_embeds);
-            } else {
             }
             
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+            {
+                omni_nvtx_scope nvtx_prefill_text_suffix("omni.stream_prefill.system_prompt.text_suffix");
+                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+            }
         } else {
             // 🔧 [与 Python 对齐] 非双工模式也需要在 system prompt 中插入 ref_audio embedding
             // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
@@ -8809,21 +8884,35 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+            {
+                omni_nvtx_scope nvtx_prefill_text_prefix("omni.stream_prefill.system_prompt.text_prefix");
+                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+            }
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
-            auto * ref_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
+            omni_embed * ref_audio_embeds = nullptr;
+            {
+                omni_nvtx_scope nvtx_ref_audio_embed("omni.stream_prefill.system_prompt.ref_audio.embed");
+                ref_audio_embeds = omni_audio_embed_make_with_filename(
+                    ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
+            }
             if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
                 print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
-                prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
-                omni_embed_free(ref_audio_embeds);
+                omni_nvtx_scope nvtx_ref_audio_prefill("omni.stream_prefill.system_prompt.ref_audio.prefill");
+                prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos,
+                                 ctx_omni->params->n_batch, &ctx_omni->n_past);
             } else {
                 print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
             }
+            if (ref_audio_embeds != nullptr) {
+                omni_embed_free(ref_audio_embeds);
+            }
             
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+            {
+                omni_nvtx_scope nvtx_prefill_text_suffix("omni.stream_prefill.system_prompt.text_suffix");
+                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+            }
         }
         
         // 标记系统 prompt 已初始化
@@ -8832,7 +8921,8 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         //把这步完成再开llm线程以防冲突
         ctx_omni->n_keep = ctx_omni->n_past;
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
-        eval_prefix(ctx_omni, ctx_omni->params);
+
+        // 去掉这里的 eval_prefix，避免重复 prefill "<|im_start|>user\n"
         
         // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
         // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
@@ -8886,49 +8976,65 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
                 }
                 std::vector<std::vector<float>> vision_chunks;
-                if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
-                        ctx_omni->params->cpuparams.n_threads, img_fname, vision_chunks)) {
-                    LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-                    return false;
+                {
+                    omni_nvtx_scope nvtx_vision_embed("omni.stream_prefill.vision.embed");
+                    if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
+                            ctx_omni->params->cpuparams.n_threads, img_fname, vision_chunks)) {
+                        LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
+                        return false;
+                    }
                 }
                 
                 int n_chunks = (int)vision_chunks.size();
                 int tokens_per_chunk = (int)vision_chunks[0].size() / hidden_size;
                 bool has_slices = (n_chunks > 1);
                 
-                std::string prefix = "<unit>";
-                eval_string(ctx_omni, ctx_omni->params, prefix.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                
-                // Overview
-                eval_string(ctx_omni, ctx_omni->params, "<image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[0].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                eval_string(ctx_omni, ctx_omni->params, "</image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                
-                // Slices (V2.6 schema)
-                if (has_slices) {
-                    for (int i = 1; i < n_chunks; i++) {
-                        eval_string(ctx_omni, ctx_omni->params, "<slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                        prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[i].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                        eval_string(ctx_omni, ctx_omni->params, "</slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+                {
+                    omni_nvtx_scope nvtx_vision_prefill("omni.stream_prefill.vision.prefill");
+                    std::string prefix = "<unit>";
+                    eval_string(ctx_omni, ctx_omni->params, prefix.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                    
+                    // Overview
+                    eval_string(ctx_omni, ctx_omni->params, "<image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                    prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[0].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
+                    eval_string(ctx_omni, ctx_omni->params, "</image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                    
+                    // Slices (V2.6 schema)
+                    if (has_slices) {
+                        for (int i = 1; i < n_chunks; i++) {
+                            eval_string(ctx_omni, ctx_omni->params, "<slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                            prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[i].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
+                            eval_string(ctx_omni, ctx_omni->params, "</slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                        }
+                        eval_string(ctx_omni, ctx_omni->params, "\n", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
                     }
-                    eval_string(ctx_omni, ctx_omni->params, "\n", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                 }
                 LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
             }
             if (aud_fname.length() > 0) {
                 print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
-                auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                omni_embed * embeds = nullptr;
+                {
+                    omni_nvtx_scope nvtx_audio_embed("omni.stream_prefill.audio.embed");
+                    embeds = omni_audio_embed_make_with_filename(
+                        ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                }
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频
                 if (embeds != nullptr && embeds->n_pos > 0) {
                     print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, embeds->n_pos);
                     // 🔧 添加音频标记，与 index=0 保持一致
-                    eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                    prefill_with_emb(ctx_omni, ctx_omni->params, embeds->embed, embeds->n_pos, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                    omni_embed_free(embeds);
+                    {
+                        omni_nvtx_scope nvtx_audio_prefill("omni.stream_prefill.audio.prefill");
+                        eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                        prefill_with_emb(ctx_omni, ctx_omni->params, embeds->embed, embeds->n_pos, ctx_omni->params->n_batch, &ctx_omni->n_past);
+                        eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
+                    }
                 } else {
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
+                }
+                if (embeds != nullptr) {
+                    omni_embed_free(embeds);
                 }
             }
         }
@@ -9680,9 +9786,13 @@ bool omni_text_infer_once(struct omni_context * ctx_omni,
     ctx_omni->round_start_positions.clear();
 
     const std::string prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    if (eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false) == false) {
-        LOG_ERR("%s: failed to eval text prompt\n", __func__);
-        return false;
+    {
+        omni_nvtx_scope nvtx_text_prefill_total("omni.text_prefill.total");
+        omni_nvtx_scope nvtx_text_prefill_eval("omni.text_prefill.eval_string");
+        if (eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false) == false) {
+            LOG_ERR("%s: failed to eval text prompt\n", __func__);
+            return false;
+        }
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
