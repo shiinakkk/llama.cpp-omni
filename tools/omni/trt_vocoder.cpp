@@ -65,7 +65,7 @@ bool TRTVocoder::init(const TRTVocoderConfig & cfg) {
     ctx_ = engine_->createExecutionContext();
     if (!ctx_) { fprintf(stderr, "[TRT] createExecutionContext failed\n"); return false; }
 
-    // Set fixed input shape
+    // Set fixed input shapes
     nvinfer1::Dims mel_dims;
     mel_dims.nbDims = 3;
     mel_dims.d[0] = 1;
@@ -73,12 +73,10 @@ bool TRTVocoder::init(const TRTVocoderConfig & cfg) {
     mel_dims.d[2] = cfg_.T_mel;
     ctx_->setInputShape("mel", mel_dims);
 
-    // Allocate I/O
+    // Allocate I/O (single-input engine: mel → stft_18ch)
     cudaStreamCreate(&stream_);
-    mel_bytes_  = 1 * 80 * cfg_.T_mel * sizeof(float);
-    // Output STFT shape depends on mel T; compute: T_stft = T_mel * upscale ≈ T_mel * 64
-    // Exact: up0(×8) × up1(×4) × up2(×2) = ×64, plus padding adjustments
-    int T_frame = cfg_.T_mel * 64; // approximate
+    mel_bytes_ = 1 * 80 * cfg_.T_mel * sizeof(float);
+    int T_frame = cfg_.T_mel * 64;
     stft_bytes_ = 1 * 18 * T_frame * sizeof(float);
 
     cudaMalloc(&d_mel_, mel_bytes_);
@@ -127,11 +125,16 @@ bool TRTVocoder::infer(const float * mel_bct, int T_mel,
         for (int t = 0; t < cfg_.T_mel; ++t)
             mel_tr[c * cfg_.T_mel + t] = mel_padded[t * 80 + c];
 
-    // Copy to GPU
+    // Copy mel to GPU
     cudaMemcpyAsync(d_mel_, mel_tr.data(), mel_bytes_, cudaMemcpyHostToDevice, stream_);
+
+    // source_stft: zero-fill (computed externally by ggml compute_source_stft)
+    // TODO: accept source_stft from caller
+    cudaMemsetAsync(d_src_, 0, src_bytes_, stream_);
 
     // Run TRT
     ctx_->setTensorAddress("mel", d_mel_);
+    ctx_->setTensorAddress("source_stft", d_src_);
     ctx_->setTensorAddress("stft_18ch", d_stft_);
     ctx_->enqueueV3(stream_);
     cudaStreamSynchronize(stream_);
@@ -141,34 +144,44 @@ bool TRTVocoder::infer(const float * mel_bct, int T_mel,
     std::vector<float> stft_host(18 * T_frame);
     cudaMemcpy(stft_host.data(), d_stft_, stft_bytes_, cudaMemcpyDeviceToHost);
 
-    // ---- iSTFT: 18ch STFT → waveform (vectorized) ----
-    // Layout: stft_host is [T_frame, 18] row-major (reshaped from [B=1, 18, T_frame])
-    // Actually PyTorch output is [1, 18, T_frame], so cudaMemcpy gives us contiguous
-    // stft_host[ch * T_frame + t] — but we need to verify
-    // Let's compute: T_frame from TRT output (depends on input T_mel)
+    // ---- Mag/Phase processing + iSTFT (matching ggml build_graph_decode) ----
+    // ONNX outputs 18ch raw: first 9ch = magnitude_log, last 9ch = raw_phase
+    // ggml applies: mag = exp(clamp(mag_log, -1e30, 1e2))
+    //               phase = sin(raw_phase)
+    //               real_ifft = mag * cos(phase)
+    //               imag_ifft = mag * sin(phase)
+    // Then IDFT → window → overlap-add
+
     T_frame_out_ = T_frame;
     int audio_len = (T_frame - 1) * HOP + N_FFT;
     wave_bt_out.assign(audio_len, 0.0f);
 
-    // Batch IDFT: td_batch[t, n] = sum_k(M[n,k] * stft[k,t])
-    // M is [16, 18] pre-computed
     for (int frame = 0; frame < T_frame; ++frame) {
-        // Gather 18 STFT values for this frame
-        float stft_vals[18];
-        for (int c = 0; c < 18; ++c)
-            stft_vals[c] = stft_host[c * T_frame + frame];
+        // Process 18ch through mag/phase nonlinearity, compute IFFT real+imag
+        float real_vals[9], imag_vals[9];
+        for (int f = 0; f < F_; ++f) {
+            float mag_log  = stft_host[f       * T_frame + frame];  // first 9ch
+            float raw_phase = stft_host[(F_ + f) * T_frame + frame]; // last 9ch
 
-        // Matrix multiply: td[16] = M[16×18] @ stft[18]
+            float mag   = std::exp(std::max(-1e30f, std::min(mag_log, 1e2f)));
+            float phase = std::sin(raw_phase);
+            real_vals[f] = mag * std::cos(phase);
+            imag_vals[f] = mag * std::sin(phase);
+        }
+
+        // IDFT: real[9] + imag[9] → time[16] using pre-computed matrix
         int base = frame * HOP;
         for (int n = 0; n < N_FFT; ++n) {
             float v = 0;
             const float * row = &idft_matrix_[n * 18];
-            for (int k = 0; k < 18; ++k)
-                v += row[k] * stft_vals[k];
+            for (int k = 0; k < F_; ++k) {
+                v += row[k] * real_vals[k] + row[F_ + k] * imag_vals[k];
+            }
             wave_bt_out[base + n] += v * window_[n];
         }
     }
 
+    // Trim padding (matching ggml: trim = 2 * PAD samples from end)
     out_T_audio = audio_len - 2 * PAD;
     if (out_T_audio < 0) out_T_audio = 0;
 

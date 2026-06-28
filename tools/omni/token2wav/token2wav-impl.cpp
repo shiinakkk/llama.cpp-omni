@@ -5327,7 +5327,8 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
                                             ggml_tensor *  speech_feat_c80_t_b,
                                             ggml_tensor *  cache_source_t1_b,
                                             ggml_tensor ** out_wave_t_b,
-                                            ggml_tensor ** out_source_t1_b) {
+                                            ggml_tensor ** out_source_t1_b,
+                                            ggml_tensor ** out_source_stft) {
     if (!ctx || !speech_feat_c80_t_b || !cache_source_t1_b || !out_wave_t_b || !out_source_t1_b) {
         return false;
     }
@@ -5378,9 +5379,14 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
     }
     s_over = ggml_cont(ctx, s_over);
     ggml_tensor * wave_t_b = nullptr;
-    if (!build_graph_decode(ctx, speech_feat_c80_t_b, s_over, &wave_t_b)) {
+    if (!build_graph_decode(ctx, speech_feat_c80_t_b, s_over, &wave_t_b, out_source_stft)) {
         LOG_ERROR( "hg2_hift.build_graph_forward: decode failed\n");
         return false;
+    }
+    if (out_source_stft) {
+        // Source-only mode: only source_stft was computed, skip waveform
+        *out_source_t1_b = s_over;
+        return true;
     }
     *out_wave_t_b    = wave_t_b;
     *out_source_t1_b = s_over;
@@ -5389,7 +5395,8 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
 bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
                                             ggml_tensor *  speech_feat_c80_t_b,
                                             ggml_tensor *  source_t1_b,
-                                            ggml_tensor ** out_wave_t_b) {
+                                            ggml_tensor ** out_wave_t_b,
+                                            ggml_tensor ** out_source_stft) {
     if (!ctx || !speech_feat_c80_t_b || !source_t1_b || !out_wave_t_b) {
         return false;
     }
@@ -5431,6 +5438,13 @@ bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
     stft_imag_tfb               = ggml_cont(ctx, stft_imag_tfb);
     ggml_tensor * s_stft_tcb    = ggml_concat(ctx, stft_real_tfb, stft_imag_tfb, 1);
     s_stft_tcb                  = ggml_cont(ctx, s_stft_tcb);
+
+    // Early exit for source-only mode (used by TRT integration)
+    if (out_source_stft) {
+        *out_source_stft = s_stft_tcb;
+        return true;
+    }
+
     ggml_tensor * x_tcb = ggml_permute(ctx, speech_feat_c80_t_b, 1, 0, 2, 3);
     x_tcb               = ggml_cont(ctx, x_tcb);
     x_tcb               = hg_hift_conv1d_f32(ctx, x_tcb, conv_pre_weight, conv_pre_bias, 1, 3, 1);
@@ -6675,7 +6689,8 @@ bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
                                                 ggml_tensor *  speech_feat_c80_t_b,
                                                 ggml_tensor *  cache_source_t1_b,
                                                 ggml_tensor ** out_wave_t_b,
-                                                ggml_tensor ** out_source_t1_b) const {
+                                                ggml_tensor ** out_source_t1_b,
+                                                ggml_tensor ** out_source_stft) const {
     if (!model || !model->hg2 || !ctx || !gf || !speech_feat_c80_t_b || !cache_source_t1_b || !out_wave_t_b ||
         !out_source_t1_b) {
         return false;
@@ -6688,8 +6703,15 @@ bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
     model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_init(ctx, 8);
     ggml_tensor * wave_t_b    = nullptr;
     ggml_tensor * source_t1_b = nullptr;
-    if (!model->hg2->gen.build_graph_forward(ctx, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
+    ggml_tensor * src_stft_tcb = nullptr;
+    if (!model->hg2->gen.build_graph_forward(ctx, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b, &src_stft_tcb)) {
         return false;
+    }
+    if (out_source_stft) {
+        // Source-only mode: only source_stft was computed
+        *out_source_stft = src_stft_tcb;
+        ggml_build_forward_expand(gf, src_stft_tcb);
+        return true;
     }
     wave_t_b    = ggml_cont(ctx, wave_t_b);
     source_t1_b = ggml_cont(ctx, source_t1_b);
@@ -6813,6 +6835,64 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     ggml_free(ctx);
     return true;
 }
+
+bool voc_hg2_runner::compute_source_stft(const std::vector<float> & speech_feat_bct,
+                                          int64_t                    T_mel,
+                                          std::vector<float> &       out_source_stft) const {
+    // Lightweight: runs only F0 predictor + NSF + source STFT (~5ms on GPU).
+    // Uses the same ggml backend but builds a source-only graph.
+    if (!model || !model->hg2 || !model->backend || !model->galloc) return false;
+    const int64_t B = 1, C = 80;
+    if (T_mel <= 0 || speech_feat_bct.size() != (size_t)(B * C * T_mel)) return false;
+
+    ggml_init_params params{};
+    params.mem_size   = 256ull * 1024ull * 1024ull;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * speech_upload   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_mel, C, B);
+    ggml_tensor * mel_tcb         = ggml_cont(ctx, ggml_permute(ctx, speech_upload, 1, 0, 2, 3));
+    ggml_tensor * dummy_cache     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 0, 1, B);
+    ggml_tensor * src_stft_tcb    = nullptr;
+    ggml_tensor * wave_dummy      = nullptr;
+    ggml_tensor * source_dummy    = nullptr;
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+    ggml_gallocr * tmp_galloc = nullptr;
+    {
+        if (!voc_hg2_runner_build_graph(ctx, gf, mel_tcb, dummy_cache, &wave_dummy, &source_dummy, &src_stft_tcb)) {
+            ggml_free(ctx); return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(model->backend);
+        tmp_galloc = ggml_gallocr_new(buft);
+        if (!tmp_galloc) { ggml_free(ctx); return false; }
+        if (!ggml_gallocr_alloc_graph(tmp_galloc, gf)) {
+            ggml_gallocr_free(tmp_galloc); ggml_free(ctx); return false;
+        }
+    }
+    // Upload mel
+    hg_backend_tensor_set(model->backend, speech_upload, speech_feat_bct.data(),
+                           speech_feat_bct.size() * sizeof(float));
+    model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
+    model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
+
+    if (ggml_backend_graph_compute(model->backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(tmp_galloc); ggml_free(ctx); return false;
+    }
+
+    // Download source_stft: [18, T_frame, B] = 18*T_frame floats
+    std::vector<float> src_tcb;
+    if (!hg_read_tensor_3d_tcb_f32(model->backend, src_stft_tcb, src_tcb)) {
+        ggml_gallocr_free(tmp_galloc); ggml_free(ctx); return false;
+    }
+    out_source_stft.swap(src_tcb);
+    ggml_gallocr_free(tmp_galloc);
+    ggml_free(ctx);
+    return true;
+}
+
 }  // namespace vocoder
 }  // namespace omni
 
