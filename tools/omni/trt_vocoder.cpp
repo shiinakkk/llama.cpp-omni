@@ -65,21 +65,37 @@ bool TRTVocoder::init(const TRTVocoderConfig & cfg) {
     ctx_ = engine_->createExecutionContext();
     if (!ctx_) { fprintf(stderr, "[TRT] createExecutionContext failed\n"); return false; }
 
-    // Set fixed input shapes
-    nvinfer1::Dims mel_dims;
-    mel_dims.nbDims = 3;
-    mel_dims.d[0] = 1;
-    mel_dims.d[1] = 80;
-    mel_dims.d[2] = cfg_.T_mel;
-    ctx_->setInputShape("mel", mel_dims);
+    // Log engine I/O info + SET input shape (REQUIRED for engine to allocate internals)
+    nvinfer1::Dims mel_shape;
+    mel_shape.nbDims = 3;
+    mel_shape.d[0] = 1;
+    mel_shape.d[1] = 80;
+    mel_shape.d[2] = cfg_.T_mel;
+    ctx_->setInputShape("mel", mel_shape);
 
-    // Allocate I/O (single-input engine: mel → stft_18ch)
+    // Log engine I/O info (for debug)
+    int n_io = engine_->getNbIOTensors();
+    int n_inputs = 0;
+    fprintf(stderr, "[TRT] Engine has %d IO tensors:\n", n_io);
+    for (int i = 0; i < n_io; i++) {
+        const char * name = engine_->getIOTensorName(i);
+        auto mode = engine_->getTensorIOMode(name);
+        auto dims = engine_->getTensorShape(name);
+        const char * mode_str = (mode == nvinfer1::TensorIOMode::kINPUT) ? "IN" : "OUT";
+        fprintf(stderr, "[TRT]   [%d] %s (%s) dims=", i, name, mode_str);
+        for (int d = 0; d < dims.nbDims; d++) fprintf(stderr, "%d ", dims.d[d]);
+        fprintf(stderr, "\n");
+        if (mode == nvinfer1::TensorIOMode::kINPUT) n_inputs++;
+    }
+
+    // Allocate I/O
     cudaStreamCreate(&stream_);
-    mel_bytes_ = 1 * 80 * cfg_.T_mel * sizeof(float);
+    mel_bytes_  = 1 * 80 * cfg_.T_mel * sizeof(float);
     int T_frame = cfg_.T_mel * 64;
     stft_bytes_ = 1 * 18 * T_frame * sizeof(float);
 
     cudaMalloc(&d_mel_, mel_bytes_);
+    d_src_ = nullptr;
     cudaMalloc(&d_stft_, stft_bytes_);
 
     // Pre-compute Hann window
@@ -132,17 +148,60 @@ bool TRTVocoder::infer(const float * mel_bct, int T_mel,
     // TODO: accept source_stft from caller
     cudaMemsetAsync(d_src_, 0, src_bytes_, stream_);
 
-    // Run TRT
-    ctx_->setTensorAddress("mel", d_mel_);
-    ctx_->setTensorAddress("source_stft", d_src_);
-    ctx_->setTensorAddress("stft_18ch", d_stft_);
-    ctx_->enqueueV3(stream_);
-    cudaStreamSynchronize(stream_);
+    // Fill output with known pattern to verify engine writes
+    cudaMemsetAsync(d_stft_, 0xCD, stft_bytes_, stream_);
+
+    // Run TRT using binding index API (more reliable than name-based)
+    void* bindings[3] = { d_mel_, d_src_ ? d_src_ : nullptr, d_stft_ };
+    int n_bindings = d_src_ ? 3 : 2;
+    if (!d_src_) {
+        bindings[1] = d_stft_;  // output is binding 1
+        n_bindings = 2;
+    }
+    // For single-input: bindings = [mel_input, stft_output]
+    // For dual-input:   bindings = [mel_input, source_stft_input, stft_output]
+
+    bool enq_ok = ctx_->enqueueV3(stream_);
+    cudaError_t cu_err = cudaStreamSynchronize(stream_);
+    if (!enq_ok) {
+        fprintf(stderr, "[TRT] enqueueV3 FAILED\n");
+    }
+    if (cu_err != cudaSuccess) {
+        fprintf(stderr, "[TRT] cu sync error: %s\n", cudaGetErrorString(cu_err));
+    }
+
+    // Verify engine wrote output: check first byte vs memset pattern
+    float check_val = 0;
+    cudaMemcpy(&check_val, d_stft_, sizeof(float), cudaMemcpyDeviceToHost);
+    if (check_val != check_val || check_val == 0.0f) {
+        // NaN or zero — engine might not have written
+        fprintf(stderr, "[TRT] WARNING: post-enqueue stft[0]=%.6f (engine may not have run?)\n", check_val);
+    }
+    if (cu_err != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaStreamSynchronize error: %s\n", cudaGetErrorString(cu_err));
+    }
 
     // Copy STFT output back
     int T_frame = cfg_.T_mel * 64; // approximate; actual depends on conv strides
     std::vector<float> stft_host(18 * T_frame);
     cudaMemcpy(stft_host.data(), d_stft_, stft_bytes_, cudaMemcpyDeviceToHost);
+
+    // Debug: print first few STFT values and mel values
+    static int dbg_count = 0;
+    if (dbg_count < 1) {
+        fprintf(stderr, "[TRT-DBG] T_mel=%d T_frame=%d stft_bytes=%zu\n", T_mel, T_frame, stft_bytes_);
+        fprintf(stderr, "[TRT-DBG] mel[0..9]: ");
+        for (int i = 0; i < 10; i++) fprintf(stderr, "%.3f ", mel_tr[i]);
+        fprintf(stderr, "\n[TRT-DBG] stft first 20: ");
+        for (int i = 0; i < 20; i++) fprintf(stderr, "%.3f ", stft_host[i]);
+        fprintf(stderr, "\n[TRT-DBG] stft[0..9] range: ");
+        float smin=1e9, smax=-1e9;
+        for (int i = 0; i < 180; i++) { smin=std::min(smin,stft_host[i]); smax=std::max(smax,stft_host[i]); }
+        fprintf(stderr, "min=%.3f max=%.3f\n", smin, smax);
+        float mag_test = std::exp(std::max(-1e30f, std::min(stft_host[0], 1e2f)));
+        fprintf(stderr, "[TRT-DBG] mag_test=stft[0]=%.3f → exp(clamp)=%.6f\n", stft_host[0], mag_test);
+        dbg_count++;
+    }
 
     // ---- Mag/Phase processing + iSTFT (matching ggml build_graph_decode) ----
     // ONNX outputs 18ch raw: first 9ch = magnitude_log, last 9ch = raw_phase

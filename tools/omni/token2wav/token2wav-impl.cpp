@@ -9880,6 +9880,11 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     bool voc_ok = false;
 #ifdef USE_TRT_VOCODER
     if (use_trt_vocoder_) {
+        // Compute source via ggml (F0+NSF+STFT, fast GPU path)
+        std::vector<float> src_stft;
+        (void)src_stft;
+        // TODO: wire compute_source_stft here once memory issue resolved
+        // For now, TRT path with zero source produces placeholder audio
         voc_ok = trt_vocoder_.infer(mel_in_bct.data(), (int)T_mel, wave_bt_out, out_T_audio);
     } else
 #endif
