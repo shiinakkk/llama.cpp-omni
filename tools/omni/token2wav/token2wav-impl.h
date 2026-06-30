@@ -1895,7 +1895,7 @@ struct hg2_stft16_params {
     std::vector<float> host_istft_ola_kernel;
     bool hg_stft16_params_init(ggml_context * ctx);
     bool hg_stft16_params_build_consts(ggml_context * ctx);
-    bool hg_stft16_params_upload_consts(ggml_backend_t backend);
+    bool hg_stft16_params_upload_consts(ggml_backend_t backend, bool include_istft = true);
 };
 }  // namespace hifigan2
 }  // namespace vocoder
@@ -1964,6 +1964,8 @@ struct hg2_hift_generator {
     std::vector<hg2_resblock> resblocks;
     ggml_tensor * conv_post_weight = nullptr;
     ggml_tensor * conv_post_bias   = nullptr;
+    ggml_tensor * dbg_source_stft_tcb = nullptr;
+    ggml_tensor * dbg_post_tcb        = nullptr;
     bool build_graph_forward(ggml_context * ctx,
                              ggml_tensor *  speech_feat_c80_t_b,
                              ggml_tensor *  cache_source_t1_b,
@@ -2031,10 +2033,17 @@ struct voc_hg2_runner {
                                     std::vector<float> &       out_source_bt1,
                                     int64_t &                  out_T_source) const;
 
-  // Compute only F0+NSF+source_STFT (~5ms on GPU). For TRT integration.
-  bool compute_source_stft(const std::vector<float> & speech_feat_bct,
-                            int64_t                    T_mel,
-                            std::vector<float> &       out_source_stft) const;
+    // Compute only F0+NSF+source_STFT (~5ms on GPU). For TRT integration.
+    bool compute_source_stft(const std::vector<float> & speech_feat_bct,
+                             int64_t                    T_mel,
+                             std::vector<float> &       out_source_stft) const;
+    bool compute_source_stft(const std::vector<float> & speech_feat_bct,
+                             int64_t                    T_mel,
+                             const std::vector<float> & cache_source_bt1,
+                             int64_t                    Tc,
+                             std::vector<float> &       out_source_stft,
+                             std::vector<float> &       out_source_bt1,
+                             int64_t &                  out_T_source) const;
 };
 }  // namespace vocoder
 }  // namespace omni

@@ -34,6 +34,9 @@ public:
     /// Source STFT must be computed externally via voc_hg2_runner::compute_source_stft.
     bool infer(const float * mel_bct, int T_mel,
                std::vector<float> & wave_bt_out, int64_t & out_T_audio);
+    bool infer(const float * mel_bct, int T_mel,
+               const float * source_stft_tcb, int T_source_frame,
+               std::vector<float> & wave_bt_out, int64_t & out_T_audio);
 
 private:
     bool ready_ = false;
@@ -50,9 +53,18 @@ private:
     size_t mel_bytes_  = 0;
     size_t src_bytes_  = 0;
     size_t stft_bytes_ = 0;
+    bool has_src_input_ = false;
+    bool dynamic_mel_   = false;
+    bool dynamic_src_   = false;
+    bool dynamic_out_   = false;
+    int  src_frames_    = 0;
+    int  stft_frames_   = 0;
+    std::string mel_name_  = "mel";
+    std::string src_name_  = "source_stft";
+    std::string stft_name_ = "stft_18ch";
 
     std::vector<float> window_;
-    std::vector<float> idft_matrix_;
+    std::vector<float> window_sq_;
     int T_frame_out_ = 0;
 };
 

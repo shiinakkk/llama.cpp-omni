@@ -17,28 +17,31 @@ def g2t(t):
     s = list(t.shape)
     if len(s) <= 1:
         return torch.from_numpy(np.frombuffer(t.data, dtype=np.float32).copy())
-    return torch.from_numpy(np.frombuffer(t.data, dtype=np.float32).reshape(s).transpose().copy())
+    return torch.from_numpy(np.frombuffer(t.data, dtype=np.float32).reshape(list(reversed(s))).copy())
 
 W = {t.name: g2t(t) for t in reader.tensors}
 print(f"Loaded {len(W)} tensors, {sum(w.numel() for w in W.values()):,} params")
 
-lrelu_slope = 0.01
-HG2_SAMPLES_PER_MEL = 4  # N_FFT / HOP = 16 / 4
+lrelu_slope = 0.1
+HG2_SAMPLES_PER_MEL = 480
+HG2_STFT_HOP = 4
 
 class Snake(nn.Module):
     def __init__(s, c): super().__init__(); s.alpha = nn.Parameter(torch.ones(c))
-    def forward(s, x): a = s.alpha.view(1, -1, 1); return x + (1./a) * (torch.sin(a * x) ** 2)
+    def forward(s, x): a = s.alpha.view(1, -1, 1); return x + (torch.sin(a * x) ** 2) / (a + 1e-9)
 
 class ResBlock(nn.Module):
     def __init__(s, c, k, dl):
         super().__init__()
         s.c1 = nn.ModuleList([nn.Conv1d(c, c, k, dilation=d, padding=(k//2)*d) for d in dl])
-        s.c2 = nn.ModuleList([nn.Conv1d(c, c, k, dilation=d, padding=(k//2)*d) for d in dl])
+        s.c2 = nn.ModuleList([nn.Conv1d(c, c, k, dilation=1, padding=k//2) for _ in dl])
         s.s1 = nn.ModuleList([Snake(c) for _ in dl])
         s.s2 = nn.ModuleList([Snake(c) for _ in dl])
     def forward(s, x):
         for c1, c2, s1, s2 in zip(s.c1, s.c2, s.s1, s.s2):
-            x = x + s2(c2(s1(c1(x))))
+            y = c1(s1(x))
+            y = c2(s2(y))
+            x = x + y
         return x
 
 class FullHiFiGAN(nn.Module):
@@ -54,13 +57,13 @@ class FullHiFiGAN(nn.Module):
 
         # Upsamplers
         s.up0 = nn.ConvTranspose1d(512, 256, 16, stride=8, padding=4)
-        s.up1 = nn.ConvTranspose1d(256, 128, 11, stride=4, padding=4, output_padding=1)
-        s.up2 = nn.ConvTranspose1d(128,  64,  7, stride=2, padding=3, output_padding=1)
+        s.up1 = nn.ConvTranspose1d(256, 128, 11, stride=5, padding=3)
+        s.up2 = nn.ConvTranspose1d(128,  64,  7, stride=3, padding=2)
 
         # source_downs: merge STFT source at each resolution
-        s.sd0 = nn.Conv1d(18, 256, 30, padding=15)
-        s.sd1 = nn.Conv1d(18, 128,  6, padding=3)
-        s.sd2 = nn.Conv1d(18,  64,  1)
+        s.sd0 = nn.Conv1d(18, 256, 30, stride=15, padding=7)
+        s.sd1 = nn.Conv1d(18, 128,  6, stride=3,  padding=1)
+        s.sd2 = nn.Conv1d(18,  64,  1, stride=1,  padding=0)
 
         # source_resblocks
         s.srb0 = ResBlock(256,  7, [1, 3, 5])
@@ -138,8 +141,6 @@ class FullHiFiGAN(nn.Module):
         x = s.up0(x)
         si0 = s.sd0(source_stft)
         si0 = s.srb0(si0)
-        sl = min(x.shape[2], si0.shape[2])
-        x, si0 = x[:, :, :sl], si0[:, :, :sl]
         x = x + si0
         x = sum(s.rb[i](x) for i in range(3)) / 3.0
         x = F.leaky_relu(x, lrelu_slope)
@@ -148,21 +149,18 @@ class FullHiFiGAN(nn.Module):
         x = s.up1(x)
         si1 = s.sd1(source_stft)
         si1 = s.srb1(si1)
-        sl = min(x.shape[2], si1.shape[2])
-        x, si1 = x[:, :, :sl], si1[:, :, :sl]
         x = x + si1
         x = sum(s.rb[i](x) for i in range(3, 6)) / 3.0
         x = F.leaky_relu(x, lrelu_slope)
 
         # Level 2: 64 channels
         x = s.up2(x)
+        x = F.pad(x, (1, 0), mode="reflect")
         si2 = s.sd2(source_stft)
         si2 = s.srb2(si2)
-        sl = min(x.shape[2], si2.shape[2])
-        x, si2 = x[:, :, :sl], si2[:, :, :sl]
         x = x + si2
         x = sum(s.rb[i](x) for i in range(6, 9)) / 3.0
-        x = F.leaky_relu(x, lrelu_slope)
+        x = F.leaky_relu(x, 0.01)
 
         return s.conv_post(x)  # [B, 18, Tout]
 
@@ -173,7 +171,7 @@ m.load()
 m.eval()
 
 TMEL = 100
-TSRC = TMEL * HG2_SAMPLES_PER_MEL // 4  # approximate: T_stft matched to T_mel upsampling
+TSRC = TMEL * HG2_SAMPLES_PER_MEL // HG2_STFT_HOP + 1
 
 dummy_mel = torch.randn(1, 80, TMEL)
 dummy_src = torch.randn(1, 18, TSRC)
@@ -188,6 +186,12 @@ torch.onnx.export(
     input_names=["mel", "source_stft"],
     output_names=["stft_18ch"],
     opset_version=17,
+    dynamo=False,
+    dynamic_axes={
+        "mel": {2: "T_mel"},
+        "source_stft": {2: "T_source"},
+        "stft_18ch": {2: "T_frame"},
+    },
 )
 sz = os.path.getsize(ONNX) / 1048576
 print(f"Exported: {ONNX} ({sz:.1f} MB)")

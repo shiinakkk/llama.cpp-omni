@@ -72,6 +72,8 @@ bool Token2WavSession::feed_window(const int32_t *      tokens,
     wave_bt_out.clear();
     int64_t T_audio = 0;
     if (!t2w.push_tokens_window(tokens, n_tokens, is_final, wave_bt_out, T_audio)) {
+        std::fprintf(stderr, "Token2WavSession::feed_window failed: n_tokens=%lld is_final=%d\n",
+                     (long long) n_tokens, (int) is_final);
         return false;
     }
     return true;
@@ -86,6 +88,8 @@ bool Token2WavSession::feed_window(const int32_t *              tokens,
     wave_tmp_.clear();
     int64_t T_audio = 0;
     if (!t2w.push_tokens_window(tokens, n_tokens, is_final, wave_tmp_, T_audio)) {
+        std::fprintf(stderr, "Token2WavSession::feed_window(callback) failed: n_tokens=%lld is_final=%d\n",
+                     (long long) n_tokens, (int) is_final);
         return false;
     }
     if (on_audio_chunk && !wave_tmp_.empty()) {

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <mutex>
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <signal.h>
@@ -77,6 +78,81 @@ static bool file_exists(const std::string & path) {
         return true;
     }
     return false;
+}
+
+static std::string pop_duplex_text(struct omni_context * ctx_omni) {
+    std::string text;
+    if (!ctx_omni) {
+        return text;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
+    while (!ctx_omni->text_queue.empty()) {
+        std::string piece = ctx_omni->text_queue.front();
+        ctx_omni->text_queue.pop_front();
+        if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__") {
+            continue;
+        }
+        text += piece;
+    }
+    return text;
+}
+
+static bool duplex_turn_finished(const struct omni_context * ctx_omni) {
+    return ctx_omni && (ctx_omni->ended_with_listen.load() || ctx_omni->current_turn_ended);
+}
+
+static int duplex_drain_llm_to_end_of_turn(struct omni_context * ctx_omni,
+                                           const std::string & debug_dir,
+                                           int max_decode_chunks,
+                                           int & speak,
+                                           int & listen,
+                                           double & sum_decode_ms) {
+    if (!ctx_omni || max_decode_chunks <= 0 || duplex_turn_finished(ctx_omni)) {
+        return 0;
+    }
+
+    printf("\n=== Drain LLM to end-of-turn: max %d decode chunks ===\n", max_decode_chunks);
+
+    int drained = 0;
+    bool reached_end = false;
+    for (int i = 0; i < max_decode_chunks && !g_is_interrupted; ++i) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = stream_decode(ctx_omni, debug_dir, /*round_idx=*/-1);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        std::string text = pop_duplex_text(ctx_omni);
+        bool is_listen = ctx_omni->ended_with_listen.load();
+        bool is_turn_done = duplex_turn_finished(ctx_omni);
+
+        if (!ok) {
+            fprintf(stderr, "[错误] drain decode %d failed\n", i + 1);
+            break;
+        }
+
+        drained++;
+        sum_decode_ms += ms;
+        if (is_listen) {
+            listen++;
+        } else {
+            speak++;
+        }
+
+        printf("--- Drain %d/%d --- decode %.1fms | n_past %d | %s\n",
+               i + 1, max_decode_chunks, ms, ctx_omni->n_past,
+               is_listen ? "<|listen|>" :
+                           ("<|speak|> \"" + (text.size() > 60 ? text.substr(0, 60) + "..." : text) + "\"").c_str());
+
+        if (is_turn_done) {
+            reached_end = true;
+            break;
+        }
+    }
+
+    if (!reached_end && !g_is_interrupted) {
+        fprintf(stderr, "[警告] drain reached max decode chunks before end-of-turn\n");
+    }
+    return drained;
 }
 
 static TestModelPaths resolve_model_paths(const std::string & llm_path) {
@@ -157,13 +233,17 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     }
 
     if (producer.joinable()) producer.join();
+
+    int drain_completed = duplex_drain_llm_to_end_of_turn(ctx_omni, "./", 8,
+                                                          speak, listen, sum_decode);
     omni_duplex_session_end(ctx_omni);
 
     double total_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - total_t0).count();
-    printf("\n=== Summary: %d/%d chunks, %.3fs | avg decode %.1fms | avg e2e %.1fms | speak %d listen %d ===\n",
-           completed, cnt, total_s,
-           completed ? sum_decode / completed : 0,
+    int total_decode_chunks = completed + drain_completed;
+    printf("\n=== Summary: %d/%d input chunks + %d drain chunks, %.3fs | avg decode %.1fms | avg e2e %.1fms | speak %d listen %d ===\n",
+           completed, cnt, drain_completed, total_s,
+           total_decode_chunks ? sum_decode / total_decode_chunks : 0,
            completed ? sum_e2e    / completed : 0,
            speak, listen);
 }

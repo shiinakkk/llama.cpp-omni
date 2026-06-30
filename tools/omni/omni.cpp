@@ -5846,25 +5846,69 @@ static void move_old_output_to_archive() {
 
 // Helper function to merge all WAV files into a single file
 static void merge_wav_files(const std::string& output_dir, int num_chunks) {
-    if (num_chunks == 0) {
-        LOG_WRN("TTS: no chunks to merge\n");
-        return;
-    }
-    
     std::string merged_file = output_dir + "/tts_output_merged.wav";
-    
-    // Check all chunk files exist
+
     std::vector<std::string> chunk_files;
-    for (int i = 0; i < num_chunks; ++i) {
-        std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
-        struct stat st;
-        if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
-            chunk_files.push_back(chunk_file);
-        } else {
-            LOG_WRN("TTS: chunk file %s does not exist or is empty\n", chunk_file.c_str());
+
+    if (num_chunks > 0) {
+        for (int i = 0; i < num_chunks; ++i) {
+            std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
+            struct stat st;
+            if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
+                chunk_files.push_back(chunk_file);
+            }
         }
     }
-    
+
+#ifndef _WIN32
+    if (chunk_files.empty()) {
+        std::vector<std::pair<int, std::string>> stream_wavs;
+        DIR * dir = opendir(output_dir.c_str());
+        if (dir) {
+            while (dirent * ent = readdir(dir)) {
+                std::string name = ent->d_name ? ent->d_name : "";
+                if (name.size() <= 8 || name.rfind("wav_", 0) != 0 ||
+                    name.compare(name.size() - 4, 4, ".wav") != 0) {
+                    continue;
+                }
+
+                bool digits_only = true;
+                int wav_id = 0;
+                for (size_t i = 4; i + 4 < name.size(); ++i) {
+                    char ch = name[i];
+                    if (ch < '0' || ch > '9') {
+                        digits_only = false;
+                        break;
+                    }
+                    wav_id = wav_id * 10 + (ch - '0');
+                }
+                if (!digits_only) {
+                    continue;
+                }
+
+                std::string path = output_dir + "/" + name;
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+                    stream_wavs.emplace_back(wav_id, path);
+                }
+            }
+            closedir(dir);
+        }
+
+        std::sort(stream_wavs.begin(), stream_wavs.end(),
+                  [](const auto & a, const auto & b) {
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                  });
+        for (const auto & item : stream_wavs) {
+            chunk_files.push_back(item.second);
+        }
+        if (!chunk_files.empty()) {
+            LOG_INF("TTS: merging %zu stream WAV files matching wav_*.wav\n", chunk_files.size());
+        }
+    }
+#endif
+
     if (chunk_files.empty()) {
         LOG_WRN("TTS: no valid WAV files to merge\n");
         return;
@@ -11269,7 +11313,12 @@ bool omni_duplex_drain_tts_audio(struct omni_context * ctx_omni,
     int idle_ticks = 0;
     for (int i = 0; i < max_ticks; ++i) {
         if (omni_tts_queues_empty(ctx_omni)) {
-            if (++idle_ticks >= idle_ticks_required) return true;
+            if (++idle_ticks >= idle_ticks_required) {
+                if (ctx_omni->duplex_mode && !ctx_omni->base_output_dir.empty()) {
+                    merge_wav_files(ctx_omni->base_output_dir + "/tts_wav", 0);
+                }
+                return true;
+            }
         } else {
             idle_ticks = 0;
         }
